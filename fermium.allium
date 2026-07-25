@@ -1,0 +1,187 @@
+-- allium: 3
+-- fermium.allium
+
+-- Scope: Behaviour of the Fermium Matrix client for Emacs.
+-- Includes: account login and logout, background synchronization, overview
+-- navigation, spaces and rooms, room conversations, message sending, and
+-- connection status.
+-- Excludes: Matrix homeserver behaviour, Matrix protocol semantics, and the
+-- implementation of Emacs buffers or synchronization machinery.
+-- Dependencies: Matrix homeservers are external systems.
+
+external entity EmacsUser {}
+external entity MatrixHomeserver {}
+
+config {
+    message_send_timeout: Duration = 30.seconds
+    reconnect_interval: Duration = 1.minute
+}
+
+entity FermiumSession {
+    user: EmacsUser
+    accounts: MatrixAccount with session = this
+}
+
+entity MatrixAccount {
+    session: FermiumSession
+    homeserver: MatrixHomeserver
+    status: online | offline
+    rooms: MatrixRoom with account = this
+    spaces: MatrixSpace with account = this
+    unread_rooms: rooms where has_unread
+}
+
+entity MatrixSpace {
+    account: MatrixAccount
+    name: String
+    parent_spaces: MatrixSpace with child_spaces = this
+    child_spaces: MatrixSpace with parent_spaces = this
+    rooms: MatrixRoom with spaces = this
+}
+
+entity MatrixRoom {
+    account: MatrixAccount
+    name: String
+    visibility: public | private
+    encryption: enabled | disabled
+    spaces: MatrixSpace with rooms = this
+    messages: MatrixMessage with room = this
+    read_through: MatrixMessage?
+    pending_messages: PendingMessage with room = this
+    latest_message: messages.last
+    has_unread: latest_message != null and (read_through = null or latest_message.timestamp > read_through.timestamp)
+}
+
+entity MatrixMessage {
+    room: MatrixRoom
+    sender: String
+    body: String
+    timestamp: Timestamp
+}
+
+entity PendingMessage {
+    room: MatrixRoom
+    body: String
+    submitted_at: Timestamp
+    status: pending | failed
+    error: String when status = failed
+}
+
+surface Overview {
+    facing viewer: EmacsUser
+    context session: FermiumSession where user = viewer
+
+    exposes:
+        session.accounts
+        session.accounts.unread_rooms
+        session.accounts.spaces
+        session.accounts.rooms
+        session.accounts.status
+
+    provides:
+        LaunchesClient(viewer)
+        UserLogsIn(viewer, homeserver, method)
+        UserLogsOut(viewer, account)
+        UserCreatesRoom(viewer, account, name, visibility, encryption)
+        UserLeavesRoom(viewer, room)
+        UserOpensRoom(viewer, room)
+}
+
+surface RoomConversation {
+    facing viewer: EmacsUser
+    context room: MatrixRoom where account.session.user = viewer
+
+    exposes:
+        room.messages
+        room.pending_messages
+        room.has_unread
+        room.account.status
+
+    provides:
+        UserSubmitsMessage(viewer, room, body)
+        UserScrollsToLatest(viewer, room)
+
+    @guarantee IncomingMessagesPreservePoint
+        -- New messages are appended without moving the user's point. When
+        -- the user is already at the bottom, the new messages are visible
+        -- automatically.
+
+    @guarantee PendingInputIsPreservedOnFailure
+        -- While a message is being sent, the input is locked. On an error or
+        -- timeout, the input is re-enabled, the pending text is retained, and
+        -- an error is shown in the messages or minibuffer.
+}
+
+rule LoginSucceeds {
+    when: MatrixLoginSucceeded(viewer, homeserver, method)
+    ensures: MatrixAccount.created(session: viewer.session, homeserver: homeserver, status: online)
+}
+
+rule ConnectionIsLost {
+    when: account: MatrixAccount.connection_lost
+    requires: account.status = online
+    ensures: account.status = offline
+}
+
+rule Reconnects {
+    when: account: MatrixAccount.reconnect_attempt_due
+    requires: account.status = offline
+    ensures: account.status = online
+}
+
+rule UserLogsOut {
+    when: UserLogsOut(viewer, account)
+    requires: account.session.user = viewer
+    ensures: not exists account
+}
+
+rule RoomCreationSucceeds {
+    when: RoomCreationConfirmed(account, name, visibility, encryption)
+    ensures: MatrixRoom.created(account: account, name: name, visibility: visibility, encryption: encryption)
+    ensures: RoomOpened(account, name)
+}
+
+rule RoomIsLeft {
+    when: RoomLeaveConfirmed(account, room)
+    ensures: not exists room
+}
+
+rule MessageSubmissionBegins {
+    when: UserSubmitsMessage(viewer, room, body)
+    requires: room.account.session.user = viewer
+    ensures: PendingMessage.created(room: room, body: body, submitted_at: now, status: pending)
+}
+
+rule MessageSendSucceeds {
+    when: MessageSendConfirmed(pending)
+    requires: pending.status = pending
+    ensures: MatrixMessage.created(room: pending.room, sender: pending.room.account.session.user, body: pending.body, timestamp: now)
+    ensures: not exists pending
+}
+
+rule MessageSendFails {
+    when: MessageSendFailed(pending, error)
+    requires: pending.status = pending
+    ensures: pending.status = failed
+    ensures: pending.error = error
+}
+
+rule MessageSendTimesOut {
+    when: pending: PendingMessage.submitted_at + config.message_send_timeout <= now
+    requires: pending.status = pending
+    ensures: pending.status = failed
+    ensures: pending.error = "Message send timed out"
+}
+
+rule RoomBecomesRead {
+    when: UserScrollsToLatest(viewer, room)
+    requires: room.account.session.user = viewer
+    requires: room.latest_message != null
+    ensures: room.read_through = room.latest_message
+}
+
+open question "What exact information is required to identify an account in the overview?"
+open question "What happens when login, room creation, room leaving, or logout fails?"
+open question "How is older room history loaded when the user scrolls upward?"
+open question "Should duplicate logins to the same homeserver be merged or rejected?"
+open question "Which optional room properties should the creation flow expose?"
