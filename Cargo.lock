@@ -886,6 +886,7 @@ name = "fermium-helper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "dirs",
  "fermium-core",
  "matrix-sdk",
