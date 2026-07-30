@@ -16,6 +16,12 @@
     (should (equal fermium--last-elisp-error
                    "helper event failed for message event (request 9): End of buffer"))))
 
+(ert-deftest fermium-event-value-treats-json-false-as-nil ()
+  (should-not (fermium--event-value
+               (json-parse-string "{\"has_unread\":false}"
+                                  :object-type 'alist)
+               "has_unread")))
+
 (ert-deftest fermium-loading-timer-failure-is-contained-and-recorded ()
   (let ((fermium--loading-timer (run-at-time 60 nil #'ignore))
         (fermium--last-elisp-error nil))
@@ -625,8 +631,8 @@
                                      'fermium-overview-row-type)
                   'visitable))
       (should (equal (get-text-property (line-beginning-position) 'face)
-                     '(fermium-overview-room-face
-                       fermium-overview-unread-face)))
+                     '(fermium-overview-unread-face
+                       fermium-overview-room-face)))
       (should-not (get-text-property (line-beginning-position) 'mouse-face))
       (should-not (get-text-property (line-beginning-position) 'keymap))
       (should-not (get-text-property (line-beginning-position) 'follow-link)))))
@@ -652,6 +658,81 @@
         (should (< newer older)))
       (should (string-match-p "1970-01-01" (buffer-string)))
       (should (string-match-p "newer preview" (buffer-string))))))
+
+(ert-deftest fermium-overview-bolds-unread-room-title-and-metadata ()
+  (with-temp-buffer
+    (fermium-overview-mode)
+    (let ((fermium--account "@alice:example.org")
+          (fermium--rooms
+           (list (list (cons "room_id" "!room:example.org")
+                       (cons "name" "Unread room")
+                       (cons "last_activity_timestamp" 2000)
+                       (cons "has_unread" t)
+                       (cons "latest_message"
+                             (list (cons "body" "unread preview")))))))
+      (fermium--render-overview)
+      (goto-char (point-min))
+      (search-forward "Unread room")
+      (should (equal (get-text-property (1- (point)) 'face)
+                     '(fermium-overview-unread-face
+                       fermium-overview-room-face)))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :weight))
+                     'bold))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :slant))
+                     'italic))
+      (search-forward "1970-01-01")
+      (should (equal (get-text-property (1- (point)) 'face)
+                     '(fermium-overview-unread-face
+                       fermium-overview-room-meta-face)))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :weight))
+                     'bold))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :slant))
+                     'italic))
+      (search-forward "unread preview")
+      (should (equal (get-text-property (1- (point)) 'face)
+                     '(fermium-overview-unread-face
+                       fermium-overview-room-meta-face)))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :weight))
+                     'bold))
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :slant))
+                     'italic)))))
+
+(ert-deftest fermium-overview-keeps-read-room-metadata-normal-weight ()
+  (with-temp-buffer
+    (fermium-overview-mode)
+    (let ((fermium--account "@alice:example.org")
+          (fermium--rooms
+           (list (list (cons "room_id" "!room:example.org")
+                       (cons "name" "Read room")
+                       (cons "last_activity_timestamp" 2000)
+                       (cons "has_unread" :false)
+                       (cons "latest_message"
+                             (list (cons "body" "read preview")))))))
+      (fermium--render-overview)
+      (goto-char (point-min))
+      (search-forward "Read room")
+      (should (equal (save-excursion
+                       (backward-char)
+                       (faces--attribute-at-point :weight))
+                     'normal))
+      (search-forward "1970-01-01")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'fermium-overview-room-meta-face))
+      (search-forward "read preview")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'fermium-overview-room-meta-face)))))
 
 (ert-deftest fermium-open-room-reuses-the-current-window ()
   (let ((overview (generate-new-buffer " *Fermium overview test*"))
@@ -1135,6 +1216,26 @@
     (should (equal (buffer-substring-no-properties
                     fermium-room--input-start (point-max))
                    "?"))))
+
+(ert-deftest fermium-room-q-is-composition-input ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org")) nil)
+    (goto-char fermium-room--input-start)
+    (should (eq (key-binding (kbd "q")) #'self-insert-command))
+    (insert "q")
+    (should (equal (buffer-substring-no-properties
+                    fermium-room--input-start (point-max))
+                   "q"))
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "q")) #'self-insert-command))
+    (should-not (lookup-key fermium-room-mode-map (kbd "q")))
+    (should-not (lookup-key fermium-room--read-only-map (kbd "q")))))
+
+(ert-deftest fermium-overview-q-quits-fermium ()
+  (should (eq (lookup-key fermium-overview-mode-map (kbd "q"))
+              #'fermium-quit)))
 
 (ert-deftest fermium-help-selects-the-overview-transient ()
   (with-temp-buffer

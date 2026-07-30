@@ -368,5 +368,6 @@ mod tests {
         .expect("room event should encode");
         assert!(room_event.contains("\"type\":\"room_updated\""));
         assert!(room_event.contains("!room:example.org"));
+        assert!(room_event.contains("\"has_unread\":false"));
     }
 }

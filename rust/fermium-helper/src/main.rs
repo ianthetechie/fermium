@@ -599,7 +599,7 @@ fn room_summary_fast(room: &Room) -> RoomSummary {
         members: Vec::new(),
         visibility: "private".to_owned(),
         encryption: "disabled".to_owned(),
-        has_unread: false,
+        has_unread: room_has_unread(room),
         last_activity_timestamp: room
             .latest_event_timestamp()
             .map(|timestamp| i64::from(timestamp.get()))
@@ -635,10 +635,14 @@ async fn room_summary(room: &Room) -> RoomSummary {
         members,
         visibility: "private".to_owned(),
         encryption: "disabled".to_owned(),
-        has_unread: false,
+        has_unread: room_has_unread(room),
         last_activity_timestamp,
         latest_message,
     }
+}
+
+fn room_has_unread(room: &Room) -> bool {
+    room.unread_notification_counts().notification_count > 0 || room.is_marked_unread()
 }
 
 async fn room_latest_message(room: &Room) -> Option<MessageSummary> {

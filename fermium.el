@@ -158,7 +158,7 @@ coloring, or replace it with a custom list of faces."
   :group 'fermium)
 
 (defface fermium-overview-unread-face
-  '((t (:weight bold)))
+  '((t (:weight bold :slant italic)))
   "Face used for rooms with unread messages."
   :group 'fermium)
 
@@ -249,7 +249,6 @@ coloring, or replace it with a custom list of faces."
     (define-key map (kbd "TAB") #'fermium-room-toggle-channel-events)
     (define-key map [mouse-2]
                 #'fermium-room--mouse-toggle-header-or-yank)
-    (define-key map (kbd "q") #'fermium-room-quit)
     map))
 
 (defvar fermium-room--read-only-map
@@ -540,10 +539,10 @@ coloring, or replace it with a custom list of faces."
    (t value)))
 
 (defun fermium--event-value (event key)
-  "Read KEY from an event alist, treating JSON null as nil."
+  "Read KEY from an event alist, treating JSON null and false as nil."
   (when (listp event)
     (let ((value (alist-get key event nil nil #'string=)))
-      (unless (eq value :null)
+      (unless (memq value '(:null :false))
         value))))
 
 (defun fermium--account-record-id (account)
@@ -1258,6 +1257,7 @@ buffers can still be created while a room's name is being resolved."
                                   (if (string-empty-p preview) 0 2))))
          (display-preview (truncate-string-to-width
                            preview preview-width nil nil "…"))
+         (unread (fermium--event-value room "has_unread"))
          (start (point))
          (timestamp-start nil)
          (timestamp-end nil)
@@ -1282,16 +1282,24 @@ buffers can still be created while a room's name is being resolved."
            'fermium-entity-id room-id
            'fermium-room-id room-id
            'fermium-account-id account-id
-           'face (if (fermium--event-value room "has_unread")
-                     '(fermium-overview-room-face
-                       fermium-overview-unread-face)
+           'face (if unread
+                     '(fermium-overview-unread-face
+                       fermium-overview-room-face)
                    'fermium-overview-room-face)))
     (when timestamp-start
       (add-text-properties timestamp-start timestamp-end
-                           '(face fermium-overview-room-meta-face)))
+                           (list 'face
+                                 (if unread
+                                     '(fermium-overview-unread-face
+                                       fermium-overview-room-meta-face)
+                                   'fermium-overview-room-meta-face))))
     (when preview-start
       (add-text-properties preview-start preview-end
-                           '(face fermium-overview-room-meta-face)))))
+                           (list 'face
+                                 (if unread
+                                     '(fermium-overview-unread-face
+                                       fermium-overview-room-meta-face)
+                                   'fermium-overview-room-meta-face))))))
 
 (defun fermium--overview-visible-rows ()
   (let (rows)
@@ -1448,8 +1456,7 @@ buffers can still be created while a room's name is being resolved."
    ("TAB" "collapse or expand header or channel events"
     fermium-room-toggle-header-or-channel-events)
    ("C-c C-c" "send the message" fermium-room-send)
-   ("C-c C-k" "clear the composition" fermium-room-clear-input)
-   ("q" "close the room" fermium-room-quit)])
+   ("C-c C-k" "clear the composition" fermium-room-clear-input)])
 
 (defun fermium-help ()
   "Show Fermium's key bindings in a temporary command popup."
