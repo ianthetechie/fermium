@@ -1119,6 +1119,89 @@
     (should (eq (get-text-property (1- (point)) 'font-lock-face)
                 'fermium-room-sender-face))))
 
+(ert-deftest fermium-room-renders-the-current-account-as-me ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (setq fermium-room--account-id "@alice:example.org")
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org"))
+     (list (list (cons "sender" "@alice:example.org")
+                 (cons "body" "hello")
+                 (cons "timestamp" 0))))
+    (should (string-match-p
+             (regexp-quote
+              (format "%s me: hello" (fermium-room--format-timestamp 0)))
+             (buffer-string)))
+    (should-not (string-match-p "@alice:example.org:" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "me")
+    (should (eq (get-text-property (1- (point)) 'face)
+                'fermium-room-sender-self-face))
+    (should (eq (get-text-property (1- (point)) 'font-lock-face)
+                'fermium-room-sender-self-face))
+    (should (equal (get-text-property (1- (point))
+                                     'fermium-room-sender-id)
+                   "@alice:example.org"))
+    (should (eq (get-text-property (1- (point))
+                                   'fermium-room-sender-role)
+                'self))))
+
+(ert-deftest fermium-room-sender-role-is-relative-to-the-room-account ()
+  (let ((message (list (cons "sender" "@alice:example.org")
+                       (cons "body" "hello")
+                       (cons "timestamp" 0)))
+        (alice-buffer (generate-new-buffer " *Fermium Alice room test*"))
+        (bob-buffer (generate-new-buffer " *Fermium Bob room test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer alice-buffer
+            (fermium-room-mode)
+            (setq fermium-room--account-id "@alice:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (list message)))
+          (with-current-buffer bob-buffer
+            (fermium-room-mode)
+            (setq fermium-room--account-id "@bob:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (list message)))
+          (with-current-buffer alice-buffer
+            (should (string-match-p " me: hello" (buffer-string)))
+            (goto-char (point-min))
+            (search-forward "me")
+            (should (eq (get-text-property (1- (point))
+                                           'fermium-room-sender-role)
+                        'self)))
+          (with-current-buffer bob-buffer
+            (should (string-match-p " @alice:example.org: hello"
+                                    (buffer-string)))
+            (goto-char (point-min))
+            (search-forward "@alice:example.org")
+            (should (equal
+                     (car (get-text-property (1- (point)) 'face))
+                     (fermium-room--message-sender-color-face message)))
+            (should (eq (get-text-property (1- (point))
+                                           'fermium-room-sender-role)
+                        'other))))
+      (kill-buffer alice-buffer)
+      (kill-buffer bob-buffer))))
+
+(ert-deftest fermium-room-sender-color-is-stable-and-bounded ()
+  (let ((palette fermium-room-sender-color-faces))
+    (should (= (length palette) 5))
+    (dolist (sender '("@alice:example.org"
+                      "@bob:example.org"
+                      "@carol:example.org"))
+      (with-temp-buffer
+        (fermium-room-mode)
+        (setq fermium-room--account-id "@viewer:example.org")
+        (let ((message (list (cons "sender" sender))))
+          (should (memq (fermium-room--message-sender-color-face message)
+                        palette))
+          (should (eq (fermium-room--message-sender-color-face message)
+                      (fermium-room--message-sender-color-face message))))))))
+
 (ert-deftest fermium-room-omits-date-for-messages-from-today ()
   (let* ((now (encode-time 0 34 12 26 7 2026))
          (timestamp (* 1000 (truncate (float-time now)))))
@@ -1135,18 +1218,48 @@
       (should (string-match-p "12:34 @bob:example.org:" (buffer-string)))
       (should-not (string-match-p "2026-07-26" (buffer-string))))))
 
-(ert-deftest fermium-room-timestamp-face-is-visibly-distinctive ()
-  (should (equal (face-attribute 'fermium-room-timestamp-face
-                                 :foreground nil t)
-                 "grey50"))
+(ert-deftest fermium-faces-use-theme-derived-semantic-parents ()
+  (dolist (face-and-parent
+           '((fermium-room-title-face . header-line)
+             (fermium-room-timestamp-face . shadow)
+             (fermium-room-sender-face . font-lock-variable-name-face)
+             (fermium-room-sender-self-face . fermium-room-sender-face)
+             (fermium-room-composition-header-face . header-line)
+             (fermium-room-channel-events-face . shadow)
+             (fermium-overview-group-face . header-line)
+             (fermium-overview-account-face . font-lock-variable-name-face)
+             (fermium-modeline-sending-face . mode-line-emphasis)))
+    (should (eq (face-attribute (car face-and-parent) :inherit nil t)
+                (cdr face-and-parent))))
+  (let ((old-shadow-foreground
+         (face-attribute 'shadow :foreground nil t))
+        (old-variable-foreground
+         (face-attribute 'font-lock-variable-name-face :foreground nil t)))
+    (unwind-protect
+        (progn
+          (set-face-attribute 'shadow nil :foreground "magenta")
+          (set-face-attribute 'font-lock-variable-name-face nil
+                              :foreground "cyan")
+          (should (equal
+                   (face-attribute 'fermium-room-timestamp-face
+                                   :foreground nil t)
+                   "magenta"))
+          (should (equal
+                   (face-attribute 'fermium-room-sender-face
+                                   :foreground nil t)
+                   "cyan")))
+      (set-face-attribute 'shadow nil :foreground old-shadow-foreground)
+      (set-face-attribute 'font-lock-variable-name-face nil
+                          :foreground old-variable-foreground)))
   (should (equal (face-attribute 'fermium-room-timestamp-face :height nil t)
                  0.9))
   (should (eq (face-attribute 'fermium-room-timestamp-face :slant nil t)
               'italic))
-  (should (equal (face-attribute 'fermium-room-sender-face :foreground nil t)
-                 "DodgerBlue3"))
   (should (eq (face-attribute 'fermium-room-sender-face :weight nil t)
               'bold))
+  (should (eq (face-attribute 'fermium-room-sender-self-face
+                              :slant nil t)
+              'italic))
   (should (eq (face-attribute 'fermium-room-composition-face :weight nil t)
               'normal))
   (should (eq (face-attribute 'fermium-room-composition-face :slant nil t)
@@ -1277,6 +1390,42 @@
                 #'fermium-room--mouse-display-image))
     (should (eq (get-text-property (1- (point)) 'face) 'default))
     (should (get-text-property (1- (point)) 'follow-link))))
+
+(ert-deftest fermium-room-image-loading-indicator-survives-empty-frame ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org"))
+     (list (list (cons "event_id" "$image")
+                 (cons "sender" "@bob:example.org")
+                 (cons "body" "photo.png")
+                 (cons "timestamp" 0)
+                 (cons "image"
+                       (list (cons "source"
+                                   (list (cons "url"
+                                               "mxc://example.org/image"))))))))
+    (puthash "$image" (list :status 'loading)
+             fermium-room--image-states)
+    (let ((fermium--loading-frame 0))
+      (should (equal (fermium-room--image-loading-dots) "."))
+      (fermium-room--render-history nil)
+      (goto-char (point-min))
+      (let ((image-position nil))
+        (while (and (not image-position) (< (point) (point-max)))
+          (when (equal (get-text-property (point) 'fermium-room-image-key)
+                       "$image")
+            (setq image-position (point)))
+          (forward-char 1))
+        (should image-position)
+        (should (equal (buffer-substring-no-properties
+                        image-position (1+ image-position))
+                       ".")))
+      (setq fermium--loading-frame 2)
+      (fermium-room--render-loading-images)
+      (goto-char (point-min))
+      (search-forward "..")
+      (should (equal (get-text-property (1- (point)) 'fermium-room-image-key)
+                     "$image")))))
 
 (ert-deftest fermium-room-displays-image-after-async-download ()
   (with-temp-buffer

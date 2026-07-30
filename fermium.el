@@ -37,24 +37,78 @@ When nil, use the development helper under this package's workspace."
   :group 'fermium)
 
 (defface fermium-room-title-face
-  '((t (:inherit font-lock-function-name-face :weight bold :height 1.2)))
+  '((t (:inherit header-line :weight bold :height 1.2)))
   "Face used for a room's title."
   :group 'fermium)
 
 (defface fermium-room-timestamp-face
-  '((t (:foreground "grey50"
+  '((t (:inherit shadow
         :height 0.9
         :slant italic)))
   "Face used for message timestamps."
   :group 'fermium)
 
 (defface fermium-room-sender-face
-  '((t (:foreground "DodgerBlue3" :weight bold)))
+  '((t (:inherit font-lock-variable-name-face :weight bold)))
   "Face used for message senders."
   :group 'fermium)
 
+(defface fermium-room-sender-self-face
+  '((t (:inherit fermium-room-sender-face :slant italic)))
+  "Face used for the current account's message senders."
+  :group 'fermium)
+
+(defface fermium-room-sender-color-0-face
+  '((((class color) (background light)) (:foreground "#005f87"))
+    (((class color) (background dark)) (:foreground "#5fafff"))
+    (t (:inherit fermium-room-sender-face)))
+  "First palette face used for other message senders."
+  :group 'fermium)
+
+(defface fermium-room-sender-color-1-face
+  '((((class color) (background light)) (:foreground "#006b4f"))
+    (((class color) (background dark)) (:foreground "#65c18c"))
+    (t (:inherit fermium-room-sender-face)))
+  "Second palette face used for other message senders."
+  :group 'fermium)
+
+(defface fermium-room-sender-color-2-face
+  '((((class color) (background light)) (:foreground "#9e2a2b"))
+    (((class color) (background dark)) (:foreground "#ff7b72"))
+    (t (:inherit fermium-room-sender-face)))
+  "Third palette face used for other message senders."
+  :group 'fermium)
+
+(defface fermium-room-sender-color-3-face
+  '((((class color) (background light)) (:foreground "#5e4b8a"))
+    (((class color) (background dark)) (:foreground "#c8a6ff"))
+    (t (:inherit fermium-room-sender-face)))
+  "Fourth palette face used for other message senders."
+  :group 'fermium)
+
+(defface fermium-room-sender-color-4-face
+  '((((class color) (background light)) (:foreground "#8a4b08"))
+    (((class color) (background dark)) (:foreground "#ffb86b"))
+    (t (:inherit fermium-room-sender-face)))
+  "Fifth palette face used for other message senders."
+  :group 'fermium)
+
+(defcustom fermium-room-sender-color-faces
+  '(fermium-room-sender-color-0-face
+    fermium-room-sender-color-1-face
+    fermium-room-sender-color-2-face
+    fermium-room-sender-color-3-face
+    fermium-room-sender-color-4-face)
+  "Faces used to distinguish other message senders.
+
+Fermium assigns a sender to a stable face from this list based on the
+sender's canonical Matrix user ID.  Set this to nil to disable sender
+coloring, or replace it with a custom list of faces."
+  :type '(repeat face)
+  :group 'fermium)
+
 (defface fermium-room-composition-header-face
-  '((t (:inherit mode-line :weight bold)))
+  '((t (:inherit header-line :weight bold)))
   "Face used for the composition area's heading."
   :group 'fermium)
 
@@ -68,17 +122,17 @@ When nil, use the development helper under this package's workspace."
   :group 'fermium)
 
 (defface fermium-room-channel-events-face
-  '((t (:inherit font-lock-keyword-face :weight bold)))
+  '((t (:inherit shadow :weight bold)))
   "Face used for collapsed channel-event headings."
   :group 'fermium)
 
 (defface fermium-overview-group-face
-  '((t (:inherit font-lock-keyword-face :weight bold)))
+  '((t (:inherit header-line :weight bold)))
   "Face used for overview rows that only group other rows."
   :group 'fermium)
 
 (defface fermium-overview-account-face
-  '((t (:inherit font-lock-type-face :weight bold)))
+  '((t (:inherit font-lock-variable-name-face :weight bold)))
   "Face used for visitable account rows in the overview."
   :group 'fermium)
 
@@ -113,7 +167,7 @@ When nil, use the development helper under this package's workspace."
   :group 'fermium)
 
 (defface fermium-modeline-sending-face
-  '((t (:inherit font-lock-constant-face :weight bold)))
+  '((t (:inherit mode-line-emphasis :weight bold)))
   "Face used for Fermium modeline sending indicators."
   :group 'fermium)
 
@@ -1880,6 +1934,44 @@ Keep both face properties: `face' is used when Font Lock is disabled, while
 buffer, which derives from `text-mode'."
   (add-text-properties start end (list 'face face 'font-lock-face face)))
 
+(defun fermium-room--message-sender-id (message)
+  "Return the canonical sender ID for MESSAGE."
+  (fermium--event-value message "sender"))
+
+(defun fermium-room--message-sender-role (message)
+  "Return MESSAGE's sender role relative to the current room buffer."
+  (if (and fermium-room--account-id
+           (equal (fermium-room--message-sender-id message)
+                  fermium-room--account-id))
+      'self
+    'other))
+
+(defun fermium-room--message-sender-label (message)
+  "Return the display label for MESSAGE's sender."
+  (if (eq (fermium-room--message-sender-role message) 'self)
+      "me"
+    (or (fermium-room--message-sender-id message) "")))
+
+(defun fermium-room--message-sender-color-face (message)
+  "Return the stable palette face for MESSAGE's other sender."
+  (let ((sender-id (fermium-room--message-sender-id message)))
+    (when (and fermium-room--account-id
+               sender-id
+               (eq (fermium-room--message-sender-role message) 'other)
+               fermium-room-sender-color-faces)
+      (nth (mod (string-to-number (substring (md5 sender-id) 0 8) 16)
+                (length fermium-room-sender-color-faces))
+           fermium-room-sender-color-faces))))
+
+(defun fermium-room--message-sender-face (message)
+  "Return the face for MESSAGE's sender role."
+  (if (eq (fermium-room--message-sender-role message) 'self)
+      'fermium-room-sender-self-face
+    (let ((color-face (fermium-room--message-sender-color-face message)))
+      (if color-face
+          (list color-face 'fermium-room-sender-face)
+        'fermium-room-sender-face))))
+
 (defun fermium-room--message-key (message)
   (or (fermium--event-value message "event_id")
       (list (fermium--event-value message "sender")
@@ -1899,7 +1991,8 @@ buffer, which derives from `text-mode'."
 
 (defun fermium-room--image-loading-dots ()
   "Return a non-empty loading indicator for an image."
-  (or (fermium--loading-dots) "."))
+  (let ((dots (fermium--loading-dots)))
+    (if (string-empty-p dots) "." dots)))
 
 (defun fermium-room--image-key-at-point ()
   (or (get-text-property (point) 'fermium-room-image-key)
@@ -2333,6 +2426,10 @@ stable reference time."
           (timestamp-value (fermium-room--message-timestamp message))
           (timestamp nil)
           (body-end nil)
+          (sender-id (fermium-room--message-sender-id message))
+          (sender-role (fermium-room--message-sender-role message))
+          (sender-label (fermium-room--message-sender-label message))
+          (sender-face (fermium-room--message-sender-face message))
           (image (fermium--event-value message "image"))
           (image-key (and image (fermium-room--message-key message)))
           (image-source (and image
@@ -2348,9 +2445,12 @@ stable reference time."
           (insert " ")
         (insert " ")
         (setq sender-start (point))
-        (insert (or (fermium--event-value message "sender") ""))
-        (fermium-room--add-face-properties
-         sender-start (point) 'fermium-room-sender-face)
+        (insert sender-label)
+        (fermium-room--add-face-properties sender-start (point) sender-face)
+        (add-text-properties
+         sender-start (point)
+         `(fermium-room-sender-id ,sender-id
+           fermium-room-sender-role ,sender-role))
         (insert ":")
         (unless image
           (insert " ")))
