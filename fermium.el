@@ -16,6 +16,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'image)
+(require 'svg nil t)
 (require 'seq)
 (require 'subr-x)
 (require 'transient)
@@ -137,6 +138,11 @@ coloring, or replace it with a custom list of faces."
   "Face used for text in the composition area."
   :group 'fermium)
 
+(defface fermium-room-composition-sending-face
+  '((t (:inherit fermium-room-timestamp-face)))
+  "Face used for composition text while its message is being sent."
+  :group 'fermium)
+
 (defface fermium-room-channel-events-face
   '((t (:inherit shadow :weight bold)))
   "Face used for collapsed channel-event headings."
@@ -219,8 +225,18 @@ coloring, or replace it with a custom list of faces."
 (defvar-local fermium-room--resizing-images nil)
 (defvar-local fermium-room--image-resize-timer nil)
 (defvar-local fermium-room--send-error nil)
+(defvar-local fermium-room--sending nil)
 (defvar-local fermium-room--header-expanded nil)
+(defvar-local fermium-room--header-image-cache-key nil)
+(defvar-local fermium-room--header-image-cache nil)
 (defvar-local fermium-room--read-message-key nil)
+
+(defun fermium-room--disable-line-numbers ()
+  "Keep line numbers disabled in the current room buffer."
+  (setq-local display-line-numbers nil)
+  (when (and (boundp 'display-line-numbers-mode)
+             display-line-numbers-mode)
+    (display-line-numbers-mode -1)))
 
 (defvar fermium-overview-mode-map
   (let ((map (make-sparse-keymap)))
@@ -249,7 +265,7 @@ coloring, or replace it with a custom list of faces."
     (set-keymap-parent map text-mode-map)
     (define-key map (kbd "C-c C-c") #'fermium-room-send)
     (define-key map (kbd "C-c C-k") #'fermium-room-clear-input)
-    (define-key map (kbd "TAB") #'fermium-room-toggle-channel-events)
+    (define-key map (kbd "TAB") #'fermium-room-toggle-header-or-channel-events)
     (define-key map [mouse-2]
                 #'fermium-room--mouse-toggle-header-or-yank)
     map))
@@ -257,7 +273,7 @@ coloring, or replace it with a custom list of faces."
 (defvar fermium-room--read-only-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "?") #'fermium-help)
-    (define-key map (kbd "TAB") #'fermium-room-toggle-channel-events)
+    (define-key map (kbd "TAB") #'fermium-room-toggle-header-or-channel-events)
     map)
   "Keymap used by the read-only part of a room buffer.")
 
@@ -265,8 +281,9 @@ coloring, or replace it with a custom list of faces."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map fermium-room--read-only-map)
     (define-key map (kbd "TAB") #'fermium-room-toggle-header)
-    (define-key map [mouse-1] #'fermium-room--mouse-toggle-header)
-    (define-key map [mouse-2] #'fermium-room--mouse-toggle-header)
+    (define-key map [header-line down-mouse-1] #'ignore)
+    (define-key map [header-line mouse-1] #'fermium-room--mouse-toggle-header)
+    (define-key map [header-line mouse-2] #'fermium-room--mouse-toggle-header)
     map)
   "Keymap used by room headers that show folded metadata.")
 
@@ -310,16 +327,24 @@ coloring, or replace it with a custom list of faces."
   (setq-local fermium-room--history-messages nil)
   (setq-local fermium-room--room-title nil)
   (setq-local fermium-room--header-expanded nil)
+  (setq-local fermium-room--header-image-cache-key nil)
+  (setq-local fermium-room--header-image-cache nil)
   (setq-local fermium-room--expanded-channel-events
               (make-hash-table :test #'equal))
   (setq-local fermium-room--image-states (make-hash-table :test #'equal))
   (setq-local fermium-room--resizing-images nil)
   (setq-local fermium-room--image-resize-timer nil)
-  (setq-local fermium-room--loading-start nil)
-  (setq-local fermium-room--loading-end nil)
   (setq-local fermium-room--message-ids (make-hash-table :test #'equal))
   (setq-local fermium-room--composition-overlay nil)
   (setq-local buffer-invisibility-spec '(fermium))
+  (setq-local header-line-format '((:eval (fermium-room--header-line))))
+  (require 'display-line-numbers nil t)
+  (when (boundp 'display-line-numbers)
+    (setq-local display-line-numbers nil))
+  (when (fboundp 'display-line-numbers-mode)
+    (add-hook 'display-line-numbers-mode-hook
+              #'fermium-room--disable-line-numbers nil t)
+    (fermium-room--disable-line-numbers))
   (setq-local mode-line-process
               '(:eval (fermium--mode-line-status)))
   (add-hook 'after-change-functions
@@ -1882,205 +1907,199 @@ buffers can still be created while a room's name is being resolved."
       (unless (equal name (buffer-name))
         (rename-buffer name t)))))
 
-(defun fermium-room--header-property-position (property)
-  "Return the first position in the header carrying PROPERTY."
-  (text-property-any (point-min) (point-max) property t))
+(defun fermium-room--header-line-text ()
+  "Return the textual form of the fixed room header."
+  (let* ((marker (if fermium-room--header-expanded "▾" "▸"))
+         (title (or fermium-room--room-title ""))
+         (line (concat marker " " title))
+         (marker-end (length marker))
+         (title-start (+ marker-end 1))
+         (title-end (length line))
+         details-start
+         details-end
+         account-label-start
+         account-label-end
+         account-value-start
+         account-value-end
+         matrix-label-start
+         matrix-label-end
+         matrix-value-start
+         matrix-value-end
+         loading-start
+         loading-end)
+    (when fermium-room--header-expanded
+      (setq details-start (length line))
+      (when fermium-room--account-id
+        (setq line (concat line "\n  Account: " fermium-room--account-id)
+              account-label-start (+ details-start 3)
+              account-label-end (+ account-label-start (length "Account:"))
+              account-value-start (+ account-label-end 1)
+              account-value-end (length line)))
+      (when fermium-room--room-id
+        (let ((prefix-start (length line)))
+          (setq line (concat line "\n  Matrix ID: " fermium-room--room-id)
+                matrix-label-start (+ prefix-start 3)
+                matrix-label-end (+ matrix-label-start (length "Matrix ID:"))
+                matrix-value-start (+ matrix-label-end 1)
+                matrix-value-end (length line))))
+      (setq details-end (length line)))
+    (when fermium-room--loading
+      (setq loading-start (length line)
+            line (concat line "\n  Loading history" (fermium--loading-dots))
+            loading-end (length line)))
+    (add-text-properties marker-end title-start
+                         '(fermium-room-header-marker t)
+                         line)
+    (add-text-properties title-start title-end
+                         '(fermium-room-header-title t)
+                         line)
+    (fermium-room--add-face-properties-to-string
+     marker-end title-start 'fermium-room-header-marker-face line)
+    (fermium-room--add-face-properties-to-string
+     title-start title-end 'fermium-room-title-face line)
+    (when (and details-start details-end)
+      (add-text-properties details-start details-end
+                           '(fermium-room-header-details t)
+                           line)
+      (when (and account-label-start account-label-end)
+        (fermium-room--add-face-properties-to-string
+         account-label-start account-label-end
+         'fermium-room-header-label-face line))
+      (when (and account-value-start account-value-end)
+        (fermium-room--add-face-properties-to-string
+         account-value-start account-value-end
+         'fermium-room-sender-self-face line))
+      (when (and matrix-label-start matrix-label-end)
+        (fermium-room--add-face-properties-to-string
+         matrix-label-start matrix-label-end
+         'fermium-room-header-label-face line))
+      (when (and matrix-value-start matrix-value-end)
+        (fermium-room--add-face-properties-to-string
+         matrix-value-start matrix-value-end
+         'fermium-room-header-other-face line)))
+    (when (and loading-start loading-end)
+      (fermium-room--add-face-properties-to-string
+       loading-start loading-end 'fermium-room-timestamp-face line))
+    line))
+
+(defun fermium-room--header-svg-face-color (face)
+  "Return the effective foreground color for FACE as an SVG color."
+  (let ((color (face-attribute face :foreground nil t)))
+    (if (and (stringp color)
+             (not (string-empty-p color))
+             (not (member color '("unspecified" "unspecified-fg"
+                                  "unspecified-bg"))))
+        color
+      (let ((default-color (face-attribute 'default :foreground nil t)))
+        (if (and (stringp default-color)
+                 (not (member default-color '("unspecified"
+                                              "unspecified-fg"
+                                              "unspecified-bg"))))
+            default-color
+          "black")))))
+
+(defun fermium-room--header-svg-image (text window)
+  "Return a multi-line SVG image for TEXT in WINDOW, when supported."
+  (when (and (window-live-p window)
+             (display-graphic-p (window-frame window))
+             (image-type-available-p 'svg)
+             (require 'svg nil t))
+    (let* ((lines (split-string (substring-no-properties text) "\n"))
+           (width (max 1 (window-pixel-width window)))
+           (frame (window-frame window))
+           (line-height (max 1 (frame-char-height frame)))
+           (font (face-attribute 'default :font nil t))
+           (font-size (or (and (fontp font) (font-get font :size))
+                          line-height))
+           (font-family (let ((family (face-attribute 'default :family nil t)))
+                          (if (and (stringp family)
+                                   (not (string-empty-p family))
+                                   (not (equal family "unspecified")))
+                              family
+                            "sans-serif")))
+           (height (* line-height (max 1 (length lines))))
+           (cache-key (list text width line-height font-size font-family
+                            (frame-parameter frame 'background-mode)))
+           (svg (or (and (equal cache-key fermium-room--header-image-cache-key)
+                        fermium-room--header-image-cache)
+                    (let ((image (svg-create width height)))
+                      (cl-loop for line in lines
+                               for row from 0
+                               for face = (cond
+                                           ((zerop row)
+                                            'fermium-room-title-face)
+                                           ((string-match-p "Loading history" line)
+                                            'fermium-room-timestamp-face)
+                                           (t 'default))
+                               do (svg-text
+                                   image line
+                                   :x 6
+                                   :y (+ (* row line-height) font-size)
+                                   :font-size font-size
+                                   :font-family font-family
+                                   :font-weight
+                                   (if (eq (face-attribute face :weight nil t)
+                                           'bold)
+                                       "bold" "normal")
+                                   :font-style
+                                   (if (eq (face-attribute face :slant nil t)
+                                           'italic)
+                                       "italic" "normal")
+                                   :fill (fermium-room--header-svg-face-color face)))
+                      (setq fermium-room--header-image-cache-key cache-key)
+                      (with-temp-buffer
+                        (svg-insert-image image)
+                        (setq fermium-room--header-image-cache
+                              (buffer-string)))))))
+      svg)))
+
+(defun fermium-room--decorate-header-string (header)
+  "Add the common interaction properties to HEADER."
+  (add-text-properties
+   0 (length header)
+   (list 'read-only t
+         'local-map fermium-room--header-map
+         'fermium-room-header t
+         'mouse-face 'highlight
+         'follow-link t
+         'help-echo "Click or TAB to expand or fold room header")
+   header)
+  header)
+
+(defun fermium-room--header-line ()
+  "Return the fixed room header, using a graphical multi-line image when able."
+  (let* ((text (fermium-room--header-line-text))
+         (window (get-buffer-window (current-buffer) t))
+         (image (fermium-room--header-svg-image text window)))
+    (fermium-room--decorate-header-string (or image text))))
 
 (defun fermium-room--update-header-title (title)
-  "Replace the visible room header title with TITLE."
-  (when-let ((title-start
-              (fermium-room--header-property-position
-               'fermium-room-header-title)))
-    (save-excursion
-      (let ((title-end
-             (next-single-property-change
-              title-start 'fermium-room-header-title nil (point-max))))
-        (let ((inhibit-read-only t))
-          (goto-char title-start)
-          (delete-region title-start title-end)
-          (insert title)
-          (fermium-room--add-face-properties
-           title-start (point) 'fermium-room-title-face)
-          (add-text-properties
-           title-start (point)
-           (list 'read-only t
-                 'keymap fermium-room--header-map
-                 'fermium-room-header t
-                 'mouse-face 'highlight
-                 'follow-link t
-                 'help-echo "Click or TAB to expand or fold room header"
-                 'fermium-room-header-title t))))
-      (when-let ((underline-start
-                  (fermium-room--header-property-position
-                   'fermium-room-header-underline)))
-        (let ((underline-end
-               (next-single-property-change
-                underline-start 'fermium-room-header-underline nil
-                (point-max))))
-          (let ((inhibit-read-only t))
-            (goto-char underline-start)
-            (delete-region underline-start underline-end)
-            (insert (make-string (+ 2 (string-width title)) ?-) "\n")
-            (add-text-properties
-             underline-start (point)
-             (list 'read-only t
-                   'keymap fermium-room--header-map
-                   'fermium-room-header t
-                   'mouse-face 'highlight
-                   'follow-link t
-                   'help-echo "Click or TAB to expand or fold room header"
-                   'fermium-room-header-underline t))))))))
+  "Update the fixed room header title to TITLE."
+  (setq fermium-room--room-title title)
+  (force-mode-line-update t))
 
 (defun fermium-room--render-header (title)
+  "Reset rendered room content and update its fixed header."
+  (setq fermium-room--room-title title)
   (when (and (overlayp fermium-room--composition-overlay)
              (overlay-buffer fermium-room--composition-overlay))
     (delete-overlay fermium-room--composition-overlay))
   (setq fermium-room--composition-overlay nil)
   (setq fermium-room--history-end nil)
   (setq fermium-room--input-start nil)
-  (setq fermium-room--loading-start nil)
-  (setq fermium-room--loading-end nil)
   (setq fermium-room--message-ids (make-hash-table :test #'equal))
   (let ((inhibit-read-only t))
-    (erase-buffer)
-    (let* ((header-start (point))
-           (marker-start (point))
-           (marker (if fermium-room--header-expanded "▾" "▸"))
-           (title-start nil)
-           (title-text-end nil)
-           (title-end nil)
-           (account-label-start nil)
-           (account-label-end nil)
-           (account-value-start nil)
-           (account-value-end nil)
-           (matrix-label-start nil)
-           (matrix-label-end nil)
-           (matrix-value-start nil)
-           (matrix-value-end nil)
-           (underline-start nil)
-           (underline-end nil)
-           (details-start nil)
-           (details-end nil))
-      (insert marker " ")
-      (setq title-start (point))
-      (insert title)
-      (setq title-text-end (point))
-      (insert "\n")
-      (setq title-end (point))
-      (setq details-start (point))
-      (when fermium-room--account-id
-        (setq account-label-start (point))
-        (insert "  Account:")
-        (setq account-label-end (point))
-        (insert " ")
-        (setq account-value-start (point))
-        (insert fermium-room--account-id)
-        (setq account-value-end (point))
-        (insert "\n"))
-      (when fermium-room--room-id
-        (setq matrix-label-start (point))
-        (insert "  Matrix ID:")
-        (setq matrix-label-end (point))
-        (insert " ")
-        (setq matrix-value-start (point))
-        (insert fermium-room--room-id)
-        (setq matrix-value-end (point))
-        (insert "\n"))
-      (setq details-end (point))
-      (setq underline-start (point))
-      (insert (make-string (+ 2 (string-width title)) ?-) "\n")
-      (setq underline-end (point))
-      (add-text-properties
-       header-start underline-end
-       (list 'read-only t
-             'keymap fermium-room--header-map
-             'fermium-room-header t
-             'mouse-face 'highlight
-             'follow-link t
-             'help-echo "Click or TAB to expand or fold room header"))
-      (add-text-properties title-start title-text-end
-                           '(fermium-room-header-title t))
-      (add-text-properties marker-start (1+ marker-start)
-                           '(fermium-room-header-marker t))
-      (add-text-properties underline-start underline-end
-                           '(fermium-room-header-underline t))
-      (fermium-room--add-face-properties header-start title-end
-                                         'fermium-room-title-face)
-      (fermium-room--add-face-properties marker-start (1+ marker-start)
-                                         'fermium-room-header-marker-face)
-      (when (and account-label-start account-label-end)
-        (fermium-room--add-face-properties
-         account-label-start account-label-end
-         'fermium-room-header-label-face))
-      (when (and account-value-start account-value-end)
-        (fermium-room--add-face-properties
-         account-value-start account-value-end
-         'fermium-room-sender-self-face))
-      (when (and matrix-label-start matrix-label-end)
-        (fermium-room--add-face-properties
-         matrix-label-start matrix-label-end
-         'fermium-room-header-label-face))
-      (when (and matrix-value-start matrix-value-end)
-        (fermium-room--add-face-properties
-         matrix-value-start matrix-value-end
-         'fermium-room-header-other-face))
-      (when (< details-start details-end)
-        (add-text-properties
-         details-start details-end
-         '(fermium-room-header-details t))
-        (unless fermium-room--header-expanded
-          (add-text-properties details-start details-end
-                               '(invisible fermium)))))
-    (when fermium-room--loading
-      (setq fermium-room--loading-start (copy-marker (point))
-            fermium-room--loading-end (copy-marker (point)))
-      (fermium-room--render-loading-indicator)
-      (goto-char (marker-position fermium-room--loading-end)))
-    (insert "\n")))
+    (erase-buffer))
+  (force-mode-line-update t))
 
 (defun fermium-room-toggle-header ()
   "Collapse or expand the room header's account and Matrix ID details."
   (interactive)
-  (if (not (or (get-text-property (point) 'fermium-room-header)
-               (get-text-property (max (point-min) (1- (point)))
-                                  'fermium-room-header)))
-      (message "Fermium: no room header at point")
+  (if (not (derived-mode-p 'fermium-room-mode))
+      (message "Fermium: no room header here")
     (setq fermium-room--header-expanded
           (not fermium-room--header-expanded))
-    (let ((details-start
-           (fermium-room--header-property-position
-            'fermium-room-header-details))
-          marker-start)
-      (let ((inhibit-read-only t))
-        (when details-start
-          (let ((details-end
-                 (next-single-property-change
-                  details-start 'fermium-room-header-details nil
-                  (point-max))))
-            (if fermium-room--header-expanded
-                (remove-text-properties details-start details-end
-                                        '(invisible))
-              (add-text-properties details-start details-end
-                                   '(invisible fermium)))))
-        (setq marker-start
-              (fermium-room--header-property-position
-               'fermium-room-header-marker))
-        (when marker-start
-          (goto-char marker-start)
-          (delete-char 1)
-          (insert (if fermium-room--header-expanded "▾" "▸"))
-          (add-text-properties
-           marker-start (1+ marker-start)
-           (list 'read-only t
-                 'keymap fermium-room--header-map
-                 'fermium-room-header t
-                 'mouse-face 'highlight
-                 'follow-link t
-                 'help-echo "Click or TAB to expand or fold room header"
-                 'fermium-room-header-marker t))
-          (fermium-room--add-face-properties
-           marker-start (1+ marker-start)
-           'fermium-room-header-marker-face))))))
+    (force-mode-line-update t)))
 
 (defun fermium-room-toggle-header-or-channel-events ()
   "Toggle the header at point, or the channel events section at point."
@@ -2089,39 +2108,17 @@ buffers can still be created while a room's name is being resolved."
           (get-text-property (max (point-min) (1- (point)))
                              'fermium-room-header))
       (fermium-room-toggle-header)
-    (fermium-room-toggle-channel-events)))
+    (if (fermium-room--channel-events-id-at-point)
+        (fermium-room-toggle-channel-events)
+      (fermium-room-toggle-header))))
 
 (defun fermium-room--render-loading-indicator ()
   "Render the animated history-loading indicator in the room header."
-  (when (and (markerp fermium-room--loading-start)
-             (markerp fermium-room--loading-end)
-             (marker-position fermium-room--loading-start)
-             (marker-position fermium-room--loading-end))
-    (let ((inhibit-read-only t)
-          (start (marker-position fermium-room--loading-start))
-          (end (marker-position fermium-room--loading-end)))
-      (save-excursion
-        (goto-char start)
-        (delete-region start end)
-        (insert (format "Loading history%s\n" (fermium--loading-dots)))
-        (add-text-properties
-         start (point)
-         (list 'read-only t 'keymap fermium-room--read-only-map))
-        (set-marker fermium-room--loading-end (point))))))
+  (force-mode-line-update t))
 
 (defun fermium-room--clear-loading-indicator ()
   "Remove the history-loading indicator from the room header."
-  (when (and (markerp fermium-room--loading-start)
-             (markerp fermium-room--loading-end)
-             (marker-position fermium-room--loading-start)
-             (marker-position fermium-room--loading-end))
-    (let ((inhibit-read-only t))
-      (delete-region (marker-position fermium-room--loading-start)
-                     (marker-position fermium-room--loading-end))))
-  (when (markerp fermium-room--loading-start)
-    (set-marker fermium-room--loading-start nil))
-  (when (markerp fermium-room--loading-end)
-    (set-marker fermium-room--loading-end nil)))
+  (force-mode-line-update t))
 
 (defun fermium-room--finish-loading ()
   "Finish or cancel the current room history load."
@@ -2341,6 +2338,10 @@ buffers can still be created while a room's name is being resolved."
   (when draft
     (insert draft))
   (fermium-room--ensure-composition-overlay)
+  ;; A message event can cause the history to be rendered again before the
+  ;; matching message-sent event arrives.  Preserve the in-flight state on
+  ;; the newly rendered composition in that interval.
+  (fermium-room--set-input-read-only fermium-room--sending)
   (goto-char (point-max)))
 
 (defun fermium-room--insert-read-only (text)
@@ -2358,9 +2359,11 @@ buffers can still be created while a room's name is being resolved."
                  (overlay-buffer fermium-room--composition-overlay))
       (setq fermium-room--composition-overlay
             (make-overlay fermium-room--input-start (point-max)
-                          (current-buffer) nil t))
-      (overlay-put fermium-room--composition-overlay
-                   'face 'fermium-room-composition-face))
+                          (current-buffer) nil t)))
+    (overlay-put fermium-room--composition-overlay
+                 'face (if fermium-room--sending
+                           'fermium-room-composition-sending-face
+                         'fermium-room-composition-face))
     (move-overlay fermium-room--composition-overlay
                   fermium-room--input-start (point-max))))
 
@@ -2374,6 +2377,14 @@ Keep both face properties: `face' is used when Font Lock is disabled, while
 `font-lock-face' prevents Font Lock from removing the styling in a room
 buffer, which derives from `text-mode'."
   (add-text-properties start end (list 'face face 'font-lock-face face)))
+
+(defun fermium-room--add-face-properties-to-string (start end face string)
+  "Apply FACE to STRING between START and END.
+
+This is the string counterpart to `fermium-room--add-face-properties', used
+for the text returned by the fixed room header's mode-line formatter."
+  (add-text-properties start end (list 'face face 'font-lock-face face)
+                       string))
 
 (defun fermium-room--message-sender-id (message)
   "Return the canonical sender ID for MESSAGE."
@@ -2586,9 +2597,9 @@ on the inside edges of WINDOW."
   (fermium-room-toggle-channel-events))
 
 (defun fermium-room--mouse-toggle-header (event)
-  "Move to EVENT and toggle the room header details there."
+  "Toggle the fixed room header in response to EVENT."
   (interactive "e")
-  (mouse-set-point event)
+  (ignore event)
   (fermium-room-toggle-header))
 
 (defun fermium-room--mouse-toggle-header-or-yank (event)
@@ -3081,6 +3092,7 @@ stable reference time."
       (message "Fermium: message sent"))))
 
 (defun fermium-room--set-input-read-only (read-only)
+  "Set whether the composition is locked and update its visual state."
   (when fermium-room--input-start
     (let ((inhibit-read-only t))
       (if read-only
@@ -3089,7 +3101,12 @@ stable reference time."
            '(read-only t))
         (remove-text-properties
          fermium-room--input-start (point-max)
-         '(read-only))))))
+         '(read-only)))))
+  (when (overlayp fermium-room--composition-overlay)
+    (overlay-put fermium-room--composition-overlay
+                 'face (if read-only
+                           'fermium-room-composition-sending-face
+                         'fermium-room-composition-face))))
 
 (defun fermium-room-send ()
   "Send the text in the room's writable tail."
