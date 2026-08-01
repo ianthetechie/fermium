@@ -203,6 +203,8 @@ coloring, or replace it with a custom list of faces."
 (defvar fermium--pending-logins nil)
 (defvar fermium--rooms nil)
 (defvar fermium--account nil)
+(defvar fermium--locally-read-rooms (make-hash-table :test #'equal))
+(defvar fermium--focus-change-hook-installed nil)
 (defvar fermium--state-loading nil)
 (defconst fermium--loading-frames '("" "." ".." "..."))
 (defvar fermium--loading-frame 0)
@@ -218,6 +220,7 @@ coloring, or replace it with a custom list of faces."
 (defvar-local fermium-room--image-resize-timer nil)
 (defvar-local fermium-room--send-error nil)
 (defvar-local fermium-room--header-expanded nil)
+(defvar-local fermium-room--read-message-key nil)
 
 (defvar fermium-overview-mode-map
   (let ((map (make-sparse-keymap)))
@@ -300,6 +303,7 @@ coloring, or replace it with a custom list of faces."
   (setq-local fermium-room--account-id nil)
   (setq-local fermium-room--sending nil)
   (setq-local fermium-room--send-error nil)
+  (setq-local fermium-room--read-message-key nil)
   (setq-local fermium-room--loading nil)
   (setq-local fermium-room--pending-messages nil)
   (setq-local fermium-room--seed-message nil)
@@ -322,6 +326,12 @@ coloring, or replace it with a custom list of faces."
             #'fermium-room--composition-after-change nil t)
   (add-hook 'window-state-change-functions
             #'fermium-room--window-state-changed nil t)
+  (add-hook 'window-selection-change-functions
+            #'fermium-room--window-selection-changed nil t)
+  (add-hook 'window-scroll-functions
+            #'fermium-room--window-scrolled nil t)
+  (add-hook 'post-command-hook
+            #'fermium-room--maybe-mark-latest-message-read nil t)
   (add-hook 'kill-buffer-hook
             #'fermium-room--cleanup-images nil t))
 
@@ -482,6 +492,7 @@ coloring, or replace it with a custom list of faces."
     (setq fermium--process nil)
     (setq fermium--process-output "")
     (clrhash fermium--pending-requests)
+    (clrhash fermium--locally-read-rooms)
     (setq fermium--state-loading nil)
     (fermium--reset-room-send-state)
     (unless fermium--stopping
@@ -548,6 +559,40 @@ coloring, or replace it with a custom list of faces."
 (defun fermium--account-record-id (account)
   "Return the user ID in ACCOUNT summary ACCOUNT."
   (fermium--event-value account "user_id"))
+
+(defun fermium--room-state-key (account-id room-id)
+  "Return the local state key for ROOM-ID belonging to ACCOUNT-ID."
+  (cons account-id room-id))
+
+(defun fermium--room-locally-read-p (account-id room-id)
+  "Return non-nil when Fermium has locally accepted ROOM-ID as read."
+  (and account-id room-id
+       (gethash (fermium--room-state-key account-id room-id)
+                fermium--locally-read-rooms)))
+
+(defun fermium--mark-room-locally-read (account-id room-id)
+  "Remember that ROOM-ID for ACCOUNT-ID was just marked read."
+  (when (and account-id room-id)
+    (puthash (fermium--room-state-key account-id room-id) t
+             fermium--locally-read-rooms)))
+
+(defun fermium--clear-room-locally-read (account-id room-id)
+  "Forget the local read override for ROOM-ID belonging to ACCOUNT-ID."
+  (when (and account-id room-id)
+    (remhash (fermium--room-state-key account-id room-id)
+             fermium--locally-read-rooms)))
+
+(defun fermium--clear-account-locally-read (account-id)
+  "Forget all local read overrides belonging to ACCOUNT-ID."
+  (when account-id
+    (let (keys)
+      (maphash
+       (lambda (key _value)
+         (when (equal (car key) account-id)
+           (push key keys)))
+       fermium--locally-read-rooms)
+      (dolist (key keys)
+        (remhash key fermium--locally-read-rooms)))))
 
 (defun fermium--pending-login-p (account)
   "Return non-nil when ACCOUNT represents an in-progress login."
@@ -806,7 +851,7 @@ buffers can still be created while a room's name is being resolved."
 
 (defun fermium--terminal-event-p (type)
   (member type '("login_succeeded" "logout_succeeded" "state" "room_opened"
-                 "media_downloaded" "message_sent" "device_verified"
+                 "media_downloaded" "message_sent" "room_read" "device_verified"
                  "error")))
 
 (defun fermium--handle-event (event)
@@ -829,6 +874,7 @@ buffers can still be created while a room's name is being resolved."
       ("message" (fermium--handle-message-event event))
       ("message_pending" (fermium--handle-message-pending event))
       ("message_sent" (fermium--handle-message-sent event))
+      ("room_read" (fermium--handle-room-read event))
       ("logout_succeeded" (fermium--handle-logout event))
       ("error" (message "Fermium: %s"
                         (fermium--event-value event "message")))
@@ -1132,6 +1178,7 @@ buffers can still be created while a room's name is being resolved."
   (setq fermium--pending-logins nil)
   (setq fermium--account nil)
   (setq fermium--rooms nil)
+  (clrhash fermium--locally-read-rooms)
   (setq fermium--state-loading nil)
   (when fermium--loading-timer
     (cancel-timer fermium--loading-timer)
@@ -1201,10 +1248,10 @@ buffers can still be created while a room's name is being resolved."
         (add-text-properties body-start (point) '(invisible fermium))))))
 
 (defun fermium--overview-room-activity-timestamp (room)
-  (or (fermium--event-value room "last_activity_timestamp")
-      (fermium--event-value (fermium--event-value room "latest_message")
-                            "timestamp")
-      0))
+  (max (or (fermium--event-value room "last_activity_timestamp") 0)
+       (or (fermium--event-value (fermium--event-value room "latest_message")
+                                 "timestamp")
+           0)))
 
 (defun fermium--overview-room-message (room)
   (fermium--event-value room "latest_message"))
@@ -1224,11 +1271,18 @@ buffers can still be created while a room's name is being resolved."
 
 (defun fermium--overview-room-sort< (left right)
   (let ((left-timestamp (fermium--overview-room-activity-timestamp left))
-        (right-timestamp (fermium--overview-room-activity-timestamp right)))
-    (if (/= left-timestamp right-timestamp)
-        (> left-timestamp right-timestamp)
-      (string-lessp (or (fermium--event-value left "name") "")
-                    (or (fermium--event-value right "name") "")))))
+        (right-timestamp (fermium--overview-room-activity-timestamp right))
+        (left-name (or (fermium--event-value left "name") ""))
+        (right-name (or (fermium--event-value right "name") ""))
+        (left-id (or (fermium--event-value left "room_id") ""))
+        (right-id (or (fermium--event-value right "room_id") "")))
+    (cond
+     ((/= left-timestamp right-timestamp)
+      (> left-timestamp right-timestamp))
+     ((not (equal left-name right-name))
+      (string-lessp left-name right-name))
+     (t
+      (string-lessp left-id right-id)))))
 
 (defun fermium--overview-sorted-rooms (&optional rooms)
   (sort (copy-sequence (or rooms fermium--rooms))
@@ -1569,7 +1623,11 @@ buffers can still be created while a room's name is being resolved."
   (fermium--stop-loading-animation-if-idle)
   (let ((accounts (fermium--event-value event "accounts"))
         (previous-account fermium--account))
-    (setq fermium--accounts accounts)
+    ;; The SDK can briefly report the pre-receipt unread state when the fast
+    ;; snapshot is reloaded.  Keep the locally accepted read state until a
+    ;; new message arrives.
+    (setq fermium--accounts
+          (fermium--apply-local-read-state accounts))
     (setq fermium--account nil)
     (setq fermium--rooms nil)
     (let ((account-ids (fermium--account-ids)))
@@ -1583,6 +1641,7 @@ buffers can still be created while a room's name is being resolved."
 (defun fermium--handle-logout (event)
   "Remove the account named by successful logout EVENT from the UI."
   (let ((account-id (fermium--event-value event "account")))
+    (fermium--clear-account-locally-read account-id)
     (setq fermium--accounts
           (cl-remove-if
            (lambda (account)
@@ -1631,6 +1690,7 @@ buffers can still be created while a room's name is being resolved."
               (clrhash fermium-room--image-states)))
           (setq fermium-room--room-id room-id)
           (setq fermium-room--account-id account-id)
+          (setq fermium-room--read-message-key nil)
           (setq fermium-room--loading t)
           (setq fermium-room--pending-messages nil)
           (fermium-room--render-loading-room room-name latest-message))
@@ -1668,7 +1728,8 @@ buffers can still be created while a room's name is being resolved."
     (when buffer
       (with-current-buffer buffer
         (fermium-room--render-room
-         room (fermium--event-value event "messages"))))))
+         room (fermium--event-value event "messages"))
+        (fermium-room--maybe-mark-latest-message-read)))))
 
 (defun fermium--handle-room-updated (event)
   "Merge an incremental room summary into the owning account."
@@ -1676,11 +1737,28 @@ buffers can still be created while a room's name is being resolved."
    (fermium--event-value event "room")
    (fermium--event-value event "account")))
 
+(defun fermium--handle-room-read (event)
+  "Refresh the overview after a room's read marker has been accepted."
+  (let ((account-id (fermium--event-value event "account"))
+        (room-id (fermium--event-value event "room_id")))
+    (fermium--mark-room-locally-read account-id room-id)
+    ;; Reapply the override to the current summary in case the read response
+    ;; arrived without a preceding room_updated event.
+    (when (and account-id room-id)
+      (fermium--upsert-room-summary
+       (list (cons "room_id" room-id)
+             (cons "has_unread" nil))
+       account-id)))
+  (when-let ((overview (get-buffer fermium--overview-buffer)))
+    (with-current-buffer overview
+      (fermium--render-overview))))
+
 (defun fermium--handle-room-removed (event)
   "Remove a room that is no longer joined for EVENT's account."
   (let ((account-id (fermium--event-value event "account"))
         (room-id (fermium--event-value event "room_id")))
     (when (and account-id room-id)
+      (fermium--clear-room-locally-read account-id room-id)
       (when-let ((account (fermium--account-record account-id)))
         (setf (alist-get "rooms" account nil nil #'string=)
               (cl-remove-if
@@ -1706,6 +1784,16 @@ buffers can still be created while a room's name is being resolved."
                    (fermium--event-value existing key))
           (setf (alist-get key merged nil nil #'string=)
                 (fermium--event-value existing key))))
+      (let ((incoming-activity
+             (fermium--event-value merged "last_activity_timestamp"))
+            (existing-activity
+             (fermium--event-value existing "last_activity_timestamp")))
+        (when (and (numberp existing-activity)
+                   (> existing-activity 0)
+                   (or (not (numberp incoming-activity))
+                       (< incoming-activity existing-activity)))
+          (setf (alist-get "last_activity_timestamp" merged nil nil #'string=)
+                existing-activity)))
       ;; Fast room updates cannot resolve names that require asynchronous
       ;; enrichment, such as the other member of a DM.  Do not replace an
       ;; already-resolved name with the room ID fallback.
@@ -1715,6 +1803,26 @@ buffers can still be created while a room's name is being resolved."
                      (equal incoming-name room-id)))
         (setf (alist-get "name" merged nil nil #'string=) existing-name))
       merged)))
+
+(defun fermium--apply-local-read-state (accounts)
+  "Apply local read overrides to the room summaries in ACCOUNTS."
+  (mapcar
+   (lambda (account)
+     (let* ((account-id (fermium--account-record-id account))
+            (merged (copy-tree account)))
+       (setf (alist-get "rooms" merged nil nil #'string=)
+             (mapcar
+              (lambda (room)
+                (if (fermium--room-locally-read-p
+                     account-id (fermium--event-value room "room_id"))
+                    (let ((read-room (copy-tree room)))
+                      (setf (alist-get "has_unread" read-room nil nil #'string=)
+                            nil)
+                      read-room)
+                  room))
+              (fermium--event-value account "rooms")))
+       merged))
+   accounts))
 
 (defun fermium--upsert-room-summary (room &optional account-id)
   (let* ((room-id (fermium--event-value room "room_id"))
@@ -1727,6 +1835,8 @@ buffers can still be created while a room's name is being resolved."
                       fermium--rooms)))
          (room (fermium--merge-room-summary existing room)))
     (when room-id
+      (when (fermium--room-locally-read-p account-id room-id)
+        (setf (alist-get "has_unread" room nil nil #'string=) nil))
       (if account-id
           (when-let ((account (fermium--account-record account-id)))
             (setf (alist-get "rooms" account nil nil #'string=)
@@ -2086,6 +2196,94 @@ buffers can still be created while a room's name is being resolved."
       ;; from being moved to the end of a rebuilt room.
       (goto-char (min point-position (point-max)))))))
 
+(defun fermium-room--message-position (key)
+  "Return the start of the rendered message identified by KEY."
+  (save-excursion
+    (when (fermium-room--goto-message-key key)
+      (point))))
+
+(defun fermium-room--message-visible-in-window-p (key window)
+  "Return non-nil when the end of message KEY is visible in WINDOW."
+  (when-let ((start (fermium-room--message-position key)))
+    (let ((end (next-single-property-change
+                start 'fermium-room-message-key nil (point-max))))
+      (and (<= (window-start window) start)
+           (<= (1- end) (window-end window t))))))
+
+(defun fermium-room--selected-focused-window ()
+  "Return the selected, focused window when it displays this room buffer."
+  (let ((window (selected-window)))
+    (when (and (window-live-p window)
+               (eq (window-frame window) (selected-frame))
+               (eq (window-buffer window) (current-buffer))
+               (eq (frame-focus-state (window-frame window)) t))
+      window)))
+
+(defun fermium-room--latest-message-visible-p (key)
+  "Return non-nil when the rendered latest message KEY is on screen."
+  (when-let ((window (fermium-room--selected-focused-window)))
+    (fermium-room--message-visible-in-window-p key window)))
+
+(defun fermium-room--maybe-mark-latest-message-read ()
+  "Mark the latest visible room message as read, if it has not been marked."
+  (when (and (derived-mode-p 'fermium-room-mode)
+             (not fermium-room--loading)
+             fermium-room--account-id
+             fermium-room--room-id)
+    (let* ((message (car (last fermium-room--history-messages)))
+           (event-id (and message
+                          (fermium--event-value message "event_id")))
+           (buffer (current-buffer)))
+      (when (and event-id
+                 (not (equal event-id fermium-room--read-message-key))
+                 (fermium-room--latest-message-visible-p event-id))
+        (setq fermium-room--read-message-key event-id)
+        (condition-case error
+            (fermium--send
+             "mark_room_read"
+             (list (cons "account" fermium-room--account-id)
+                   (cons "room_id" fermium-room--room-id)
+                   (cons "event_id" event-id))
+             (lambda (event)
+               (when (and (equal (fermium--event-value event "type") "error")
+                          (buffer-live-p buffer))
+                 (with-current-buffer buffer
+                   (when (equal fermium-room--read-message-key event-id)
+                     (setq fermium-room--read-message-key nil))))))
+          (error
+           (setq fermium-room--read-message-key nil)
+           (message "Fermium: could not mark room as read: %s"
+                    (error-message-string error))))))))
+
+(defun fermium-room--window-selection-changed (window)
+  "Retry marking the latest message when WINDOW is selected or deselected."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (fermium-room--maybe-mark-latest-message-read)))
+
+(defun fermium-room--window-scrolled (window _start)
+  "Retry marking the latest message after WINDOW has been scrolled."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (fermium-room--maybe-mark-latest-message-read)))
+
+(defun fermium--after-focus-change ()
+  "Retry marking a room when the selected Emacs frame gains focus."
+  (let ((window (selected-window)))
+    (when (and (window-live-p window)
+               (buffer-live-p (window-buffer window)))
+      (with-current-buffer (window-buffer window)
+        (when (derived-mode-p 'fermium-room-mode)
+          (fermium-room--maybe-mark-latest-message-read))))))
+
+(unless fermium--focus-change-hook-installed
+  ;; `focus-in-hook' is obsolete in recent Emacsen.  The replacement is a
+  ;; function variable, so install a single global observer and let the room
+  ;; predicate decide whether the selected window is eligible.
+  (add-function :after after-focus-change-function
+                #'fermium--after-focus-change)
+  (setq fermium--focus-change-hook-installed t))
+
 (defun fermium-room--render-history-contents (draft)
   "Render room contents without changing the caller's point policy."
   ;; Re-rendering installs image display properties.  Those are derived UI
@@ -2378,7 +2576,8 @@ on the inside edges of WINDOW."
             (setq fermium-room--image-resize-timer
                   (run-with-idle-timer
                    0 nil #'fermium-room--refresh-image-sizes-in-buffer
-                   buffer window))))))))
+                   buffer window))
+            (fermium-room--maybe-mark-latest-message-read)))))))
 
 (defun fermium-room--mouse-toggle-channel-events (event)
   "Move to EVENT and toggle the channel-event section there."
@@ -2825,6 +3024,7 @@ stable reference time."
         (setf (alist-get "last_activity_timestamp" room nil nil #'string=)
               (max timestamp
                    (or (fermium--event-value room "last_activity_timestamp") 0)))
+        (setf (alist-get "has_unread" room nil nil #'string=) t)
         (setq updated t)))))
 
 (defun fermium--handle-message-event (event)
@@ -2832,6 +3032,7 @@ stable reference time."
          (room-id (fermium--event-value event "room_id"))
          (message (fermium--event-value event "message"))
          (buffer (fermium--room-by-id room-id account-id)))
+    (fermium--clear-room-locally-read account-id room-id)
     (when (and room-id message
                (fermium--update-room-summary-from-message
                 room-id message account-id))
@@ -2849,7 +3050,8 @@ stable reference time."
               (fermium-room--render-history
                (and fermium-room--input-start
                     (buffer-substring-no-properties
-                     fermium-room--input-start (point-max)))))
+                     fermium-room--input-start (point-max))))
+              (fermium-room--maybe-mark-latest-message-read))
           (push message fermium-room--pending-messages))))))
 
 (defun fermium--handle-message-pending (event)

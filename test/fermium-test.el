@@ -181,7 +181,8 @@
   (let* ((existing-room
           (list (cons "room_id" "!dm:example.org")
                 (cons "name" "Bob")
-                (cons "members" (list "Bob"))))
+                (cons "members" (list "Bob"))
+                (cons "last_activity_timestamp" 2000)))
          (fermium--accounts
           (list (list (cons "user_id" "@alice:example.org")
                       (cons "rooms" (list existing-room)))))
@@ -194,10 +195,53 @@
                  (list (cons "room_id" "!dm:example.org")
                        (cons "name" "!dm:example.org")
                        (cons "is_dm" t)
-                       (cons "members" nil)))))
+                       (cons "members" nil)
+                       (cons "last_activity_timestamp" 0)))))
     (let ((room (car (fermium--rooms-for-account "@alice:example.org"))))
       (should (equal (fermium--event-value room "name") "Bob"))
-      (should (equal (fermium--event-value room "members") (list "Bob"))))))
+      (should (equal (fermium--event-value room "members") (list "Bob")))
+      (should (= (fermium--event-value room "last_activity_timestamp")
+                 2000)))))
+
+(ert-deftest fermium-state-refresh-keeps-enriched-room-names ()
+  (let* ((room (list (cons "room_id" "!dm:example.org")
+                     (cons "name" "Bob")
+                     (cons "members" (list "Bob"))
+                     (cons "last_activity_timestamp" 2000)
+                     (cons "latest_message"
+                           (list (cons "body" "latest")))))
+         (account (list (cons "user_id" "@alice:example.org")
+                        (cons "rooms" (list room))))
+         (fermium--accounts nil)
+         (fermium--account "@alice:example.org")
+         (fermium--rooms nil))
+    (fermium--handle-state
+     (list (cons "type" "state")
+           (cons "accounts" (list account))))
+    (let ((refreshed-room
+           (car (fermium--rooms-for-account "@alice:example.org"))))
+      (should (equal (fermium--event-value refreshed-room "name") "Bob"))
+      (should (equal (fermium--event-value refreshed-room "members")
+                     (list "Bob")))
+      (should (= (fermium--overview-room-activity-timestamp refreshed-room)
+                 2000))
+      (should (equal (fermium--event-value
+                      (fermium--event-value refreshed-room "latest_message")
+                      "body")
+                     "latest")))))
+
+(ert-deftest fermium-overview-room-order-is-deterministic-for-ties ()
+  (let ((rooms
+         (list (list (cons "room_id" "!z:example.org")
+                     (cons "name" "Same name")
+                     (cons "last_activity_timestamp" 1000))
+               (list (cons "room_id" "!a:example.org")
+                     (cons "name" "Same name")
+                     (cons "last_activity_timestamp" 1000)))))
+    (should (equal
+             (mapcar (lambda (room) (fermium--event-value room "room_id"))
+                     (fermium--overview-sorted-rooms rooms))
+             (list "!a:example.org" "!z:example.org")))))
 
 (ert-deftest fermium-room-removal-is-scoped-to-its-account ()
   (let ((fermium--accounts
@@ -324,16 +368,18 @@
             ;; Bob's login finishes (or is removed) while Alice's history
             ;; request is still in flight, so the account count changes.
             (setq fermium--pending-logins nil)
-            (fermium--handle-room-opened
-             (list (cons "type" "room_opened")
-                   (cons "account" "@alice:example.org")
-                   (cons "room"
-                         (list (cons "room_id" "!room:example.org")
-                               (cons "name" "Example room")))
-                   (cons "messages"
-                         (list (list (cons "event_id" "$history")
-                                     (cons "body" "history")
-                                     (cons "timestamp" 1000))))))
+            (cl-letf (((symbol-function 'fermium--send)
+                       (lambda (&rest _args) nil)))
+              (fermium--handle-room-opened
+               (list (cons "type" "room_opened")
+                     (cons "account" "@alice:example.org")
+                     (cons "room"
+                           (list (cons "room_id" "!room:example.org")
+                                 (cons "name" "Example room")))
+                     (cons "messages"
+                           (list (list (cons "event_id" "$history")
+                                       (cons "body" "history")
+                                       (cons "timestamp" 1000)))))))
             (with-current-buffer room
               (should-not fermium-room--loading)
               (should (string-match-p "history" (buffer-string))))))
@@ -734,6 +780,81 @@
       (should (eq (get-text-property (1- (point)) 'face)
                   'fermium-overview-room-meta-face)))))
 
+(ert-deftest fermium-room-read-refreshes-the-overview ()
+  (let ((overview (get-buffer-create fermium--overview-buffer))
+        (room (list (cons "room_id" "!room:example.org")
+                    (cons "name" "Example room")
+                    (cons "has_unread" t))))
+    (unwind-protect
+        (let ((fermium--accounts
+               (list (list (cons "user_id" "@alice:example.org")
+                           (cons "rooms" (list room)))))
+              (fermium--account "@alice:example.org")
+              (fermium--rooms (list room)))
+          (with-current-buffer overview
+            (fermium-overview-mode)
+            (fermium--render-overview))
+          (fermium--handle-room-updated
+           (list (cons "account" "@alice:example.org")
+                 (cons "room"
+                       (list (cons "room_id" "!room:example.org")
+                             (cons "name" "Example room")
+                             (cons "has_unread" nil)))))
+          (fermium--handle-room-read nil)
+          (with-current-buffer overview
+            (goto-char (point-min))
+            (search-forward "Example room")
+            (should-not (equal (get-text-property (1- (point)) 'face)
+                               '(fermium-overview-unread-face
+                                 fermium-overview-room-face)))))
+      (when (buffer-live-p overview)
+        (kill-buffer overview)))))
+
+(ert-deftest fermium-room-read-survives-fast-refresh-and-enrichment ()
+  (let* ((room (list (cons "room_id" "!room:example.org")
+                     (cons "name" "Example room")
+                     (cons "has_unread" t)))
+         (fermium--accounts
+          (list (list (cons "user_id" "@alice:example.org")
+                      (cons "rooms" (list room)))))
+         (fermium--account "@alice:example.org")
+         (fermium--rooms nil)
+         (fermium--locally-read-rooms (make-hash-table :test #'equal)))
+    (fermium--handle-room-read
+     (list (cons "account" "@alice:example.org")
+           (cons "room_id" "!room:example.org")))
+    ;; Both the fast state response and the enriched update can still carry
+    ;; the SDK's stale unread flag; the local read decision must win.
+    (fermium--handle-state
+     (list (cons "type" "state")
+           (cons "accounts"
+                 (list (list (cons "user_id" "@alice:example.org")
+                             (cons "rooms"
+                                   (list (list
+                                          (cons "room_id" "!room:example.org")
+                                          (cons "name" "!room:example.org")
+                                          (cons "has_unread" t)))))))))
+    (fermium--handle-room-updated
+     (list (cons "account" "@alice:example.org")
+           (cons "room"
+                 (list (cons "room_id" "!room:example.org")
+                       (cons "name" "Example room")
+                       (cons "has_unread" t)))))
+    (let ((refreshed-room
+           (car (fermium--rooms-for-account "@alice:example.org"))))
+      (should-not (fermium--event-value refreshed-room "has_unread")))
+    ;; A new message clears the override and makes the room unread again.
+    (fermium--handle-message-event
+     (list (cons "account" "@alice:example.org")
+           (cons "room_id" "!room:example.org")
+           (cons "message"
+                 (list (cons "event_id" "$new")
+                       (cons "body" "new message")
+                       (cons "timestamp" 3000)))))
+    (should (fermium--event-value
+             (car (fermium--rooms-for-account "@alice:example.org"))
+             "has_unread"))))
+
 (ert-deftest fermium-open-room-reuses-the-current-window ()
   (let ((overview (generate-new-buffer " *Fermium overview test*"))
         (room nil))
@@ -1020,6 +1141,138 @@
                              (buffer-substring-no-properties
                               fermium-room--input-start (point-max))))
     (should (= (point) (point-max)))))
+
+(ert-deftest fermium-room-marks-the-visible-latest-message-read-once ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room read test*")) sent)
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--account-id "@alice:example.org")
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" fermium-room--room-id))
+             (list (list (cons "event_id" "$latest")
+                         (cons "sender" "@bob:example.org")
+                         (cons "body" "latest")
+                         (cons "timestamp" 1000))))
+            (cl-letf (((symbol-function 'frame-focus-state)
+                       (lambda (&optional _frame) t))
+                      ((symbol-function 'fermium--send)
+                       (lambda (command payload _callback)
+                         (push (list command payload) sent))))
+              (fermium-room--maybe-mark-latest-message-read)
+              (fermium-room--maybe-mark-latest-message-read))
+            (should (equal sent
+                           (list
+                            (list "mark_room_read"
+                                  (list (cons "account" "@alice:example.org")
+                                        (cons "room_id" "!room:example.org")
+                                        (cons "event_id" "$latest")))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-does-not-mark-without-frame-focus ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room unfocused read test*"))
+          sent)
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--account-id "@alice:example.org")
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" fermium-room--room-id))
+             (list (list (cons "event_id" "$latest")
+                         (cons "sender" "@bob:example.org")
+                         (cons "body" "latest")
+                         (cons "timestamp" 1000))))
+            (cl-letf (((symbol-function 'frame-focus-state)
+                       (lambda (&optional _frame) nil))
+                      ((symbol-function 'fermium--send)
+                       (lambda (&rest args) (setq sent args))))
+              (fermium-room--maybe-mark-latest-message-read))
+            (should-not sent))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-does-not-mark-without-a-window ()
+  (let (sent)
+    (with-temp-buffer
+      (fermium-room-mode)
+      (setq fermium-room--account-id "@alice:example.org")
+      (setq fermium-room--room-id "!room:example.org")
+      (fermium-room--render-room
+       (list (cons "room_id" fermium-room--room-id))
+       (list (list (cons "event_id" "$latest")
+                   (cons "sender" "@bob:example.org")
+                   (cons "body" "latest")
+                   (cons "timestamp" 1000))))
+      (cl-letf (((symbol-function 'frame-focus-state)
+                 (lambda (&optional _frame) t))
+                ((symbol-function 'fermium--send)
+                 (lambda (&rest args) (setq sent args))))
+        (fermium-room--maybe-mark-latest-message-read)))
+    (should-not sent)))
+
+(ert-deftest fermium-room-retries-after-focus-returns ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room focus retry test*"))
+          sent)
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--account-id "@alice:example.org")
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" fermium-room--room-id))
+             (list (list (cons "event_id" "$latest")
+                         (cons "sender" "@bob:example.org")
+                         (cons "body" "latest")
+                         (cons "timestamp" 1000))))
+            (cl-letf (((symbol-function 'frame-focus-state)
+                       (lambda (&optional _frame) t))
+                      ((symbol-function 'fermium--send)
+                       (lambda (&rest args) (setq sent args))))
+              (fermium--after-focus-change))
+            (should sent))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-does-not-mark-in-a-non-selected-window ()
+  (save-window-excursion
+    (let ((room (get-buffer-create " *Fermium room non-selected read test*"))
+          (other (get-buffer-create " *Fermium room other window test*"))
+          sent)
+      (unwind-protect
+          (progn
+            (switch-to-buffer other)
+            (let ((room-window (split-window-right)))
+              (with-current-buffer room
+                (fermium-room-mode)
+                (setq fermium-room--account-id "@alice:example.org")
+                (setq fermium-room--room-id "!room:example.org")
+                (fermium-room--render-room
+                 (list (cons "room_id" fermium-room--room-id))
+                 (list (list (cons "event_id" "$latest")
+                             (cons "sender" "@bob:example.org")
+                             (cons "body" "latest")
+                             (cons "timestamp" 1000))))
+                (set-window-buffer room-window room))
+              (cl-letf (((symbol-function 'frame-focus-state)
+                         (lambda (&optional _frame) t))
+                        ((symbol-function 'fermium--send)
+                         (lambda (&rest args) (setq sent args))))
+                (with-current-buffer room
+                  (fermium-room--maybe-mark-latest-message-read)))
+              (should-not sent)))
+        (when (buffer-live-p room)
+          (kill-buffer room))
+        (when (buffer-live-p other)
+          (kill-buffer other))))))
 
 (ert-deftest fermium-room-loading-indicator-uses-animation-frame ()
   (with-temp-buffer

@@ -25,9 +25,9 @@ use matrix_sdk::{
     config::SyncSettings,
     deserialized_responses::TimelineEvent,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy},
-    room::MessagesOptions,
+    room::{MessagesOptions, Receipts},
     ruma::{
-        RoomId,
+        OwnedEventId, RoomId,
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             room::{
@@ -196,6 +196,12 @@ async fn handle_request(
         Request::OpenRoom {
             account, room_id, ..
         } => open_room(&sessions, &events, request_id, account, room_id).await,
+        Request::MarkRoomRead {
+            account,
+            room_id,
+            event_id,
+            ..
+        } => mark_room_read(&sessions, &events, request_id, account, room_id, event_id).await,
         Request::DownloadMedia {
             account, source, ..
         } => download_media(&sessions, &events, request_id, account, source).await,
@@ -418,6 +424,10 @@ async fn list_state(
     };
     let mut clients = clients;
     clients.sort_by(|left, right| left.0.cmp(&right.0));
+    let enrichment_clients: Vec<(String, Client)> = clients
+        .iter()
+        .map(|(account, _, client, _, _)| (account.clone(), client.clone()))
+        .collect();
     let mut accounts = Vec::with_capacity(clients.len());
     for (user_id, homeserver, client, initial_sync_complete, connection_state) in clients {
         accounts.push(AccountSummary {
@@ -437,6 +447,9 @@ async fn list_state(
         })
         .await
         .context("sending state response")?;
+    for (account, client) in enrichment_clients {
+        spawn_room_enrichment(&client, events, &account);
+    }
     Ok(())
 }
 
@@ -471,6 +484,54 @@ async fn open_room(
         })
         .await
         .context("sending room response")?;
+    Ok(())
+}
+
+async fn mark_room_read(
+    sessions: &SharedSessions,
+    events: &EventSender,
+    request_id: u64,
+    account: String,
+    room_id: String,
+    event_id: String,
+) -> Result<()> {
+    let client = session_client(sessions, &account).await?;
+    let room_id = RoomId::parse(&room_id).context("room ID is invalid")?;
+    let event_id = event_id
+        .parse::<OwnedEventId>()
+        .context("event ID is invalid")?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| anyhow!("room is not joined"))?;
+
+    room.send_multiple_receipts(
+        Receipts::new()
+            .fully_read_marker(event_id.clone())
+            .public_read_receipt(event_id),
+    )
+    .await
+    .context("marking room as read")?;
+
+    // The SDK updates the server and its marked-unread flag asynchronously from
+    // the perspective of the overview.  Publish the local state change now so
+    // the room row stops looking unread without waiting for another sync.
+    let mut summary = room_summary_fast(&room);
+    summary.has_unread = false;
+    events
+        .send(Event::RoomUpdated {
+            account: account.clone(),
+            room: summary,
+        })
+        .await
+        .context("sending room read update")?;
+    events
+        .send(Event::RoomRead {
+            request_id,
+            account,
+            room_id: room_id.to_string(),
+        })
+        .await
+        .context("sending room read response")?;
     Ok(())
 }
 
@@ -623,11 +684,15 @@ async fn room_summary(room: &Room) -> RoomSummary {
         members.join(", ")
     };
     let latest_message = room_latest_message(room).await;
-    let last_activity_timestamp = room
-        .latest_event_timestamp()
-        .map(|timestamp| i64::from(timestamp.get()))
-        .or_else(|| latest_message.as_ref().map(|message| message.timestamp))
-        .unwrap_or_default();
+    let last_activity_timestamp = [
+        room.latest_event_timestamp()
+            .map(|timestamp| i64::from(timestamp.get())),
+        latest_message.as_ref().map(|message| message.timestamp),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or_default();
     RoomSummary {
         room_id: room.room_id().to_string(),
         name,

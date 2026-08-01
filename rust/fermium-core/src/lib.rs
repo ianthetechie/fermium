@@ -38,6 +38,12 @@ pub enum Request {
         account: String,
         room_id: String,
     },
+    MarkRoomRead {
+        request_id: u64,
+        account: String,
+        room_id: String,
+        event_id: String,
+    },
     DownloadMedia {
         request_id: u64,
         account: String,
@@ -64,6 +70,7 @@ impl Request {
             | Self::Logout { request_id, .. }
             | Self::ListState { request_id }
             | Self::OpenRoom { request_id, .. }
+            | Self::MarkRoomRead { request_id, .. }
             | Self::DownloadMedia { request_id, .. }
             | Self::SendMessage { request_id, .. }
             | Self::Quit { request_id } => *request_id,
@@ -113,6 +120,11 @@ pub enum Event {
         account: String,
         room: RoomSummary,
         messages: Vec<MessageSummary>,
+    },
+    RoomRead {
+        request_id: u64,
+        account: String,
+        room_id: String,
     },
     RoomUpdated {
         account: String,
@@ -369,5 +381,32 @@ mod tests {
         assert!(room_event.contains("\"type\":\"room_updated\""));
         assert!(room_event.contains("!room:example.org"));
         assert!(room_event.contains("\"has_unread\":false"));
+    }
+
+    #[test]
+    fn protocol_decodes_mark_room_read_request() {
+        let request: Request = serde_json::from_str(
+            r#"{"command":"mark_room_read","request_id":14,"account":"@alice:example.org","room_id":"!room:example.org","event_id":"$event:example.org"}"#,
+        )
+        .expect("mark room read request should decode");
+
+        assert_eq!(request.request_id(), 14);
+        let encoded = serde_json::to_string(&request).expect("request metadata should encode");
+        assert!(encoded.contains("!room:example.org"));
+        assert!(encoded.contains("$event:example.org"));
+    }
+
+    #[test]
+    fn room_read_event_is_line_protocol_friendly() {
+        let event = Event::RoomRead {
+            request_id: 15,
+            account: "@alice:example.org".to_owned(),
+            room_id: "!room:example.org".to_owned(),
+        };
+        let encoded = serde_json::to_string(&event).expect("room read event should encode");
+        assert_eq!(
+            encoded,
+            r#"{"type":"room_read","request_id":15,"account":"@alice:example.org","room_id":"!room:example.org"}"#
+        );
     }
 }
