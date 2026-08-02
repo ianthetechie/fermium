@@ -1527,6 +1527,7 @@
                  (cons "timestamp" 0))))
     (should (get-text-property (point-min) 'read-only))
     (goto-char (point-min))
+    (should-error (insert "edited at start"))
     (search-forward "hello")
     (should (get-text-property (1- (point)) 'read-only))
     (should-error (insert "edited"))

@@ -2342,6 +2342,14 @@ buffers can still be created while a room's name is being resolved."
   ;; matching message-sent event arrives.  Preserve the in-flight state on
   ;; the newly rendered composition in that interval.
   (fermium-room--set-input-read-only fermium-room--sending)
+  ;; A `read-only' text property does not protect insertion immediately before
+  ;; the first character carrying it.  Make the room's first history
+  ;; character front-sticky so point-min cannot be used to insert into the
+  ;; read-only area.
+  (when (< (point-min) (point-max))
+    (add-text-properties
+     (point-min) (1+ (point-min))
+     '(front-sticky (read-only keymap))))
   (goto-char (point-max)))
 
 (defun fermium-room--insert-read-only (text)
