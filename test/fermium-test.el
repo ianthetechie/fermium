@@ -1568,9 +1568,21 @@
                     fermium-room--input-start (point-max))
                    "q"))
     (goto-char (point-min))
-    (should (eq (key-binding (kbd "q")) #'self-insert-command))
-    (should-not (lookup-key fermium-room-mode-map (kbd "q")))
-    (should-not (lookup-key fermium-room--read-only-map (kbd "q")))))
+    (should (eq (key-binding (kbd "q"))
+                #'fermium-room--redirect-self-insert))))
+
+(ert-deftest fermium-room-read-only-self-insertion-goes-to-composition ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org")) nil)
+    (goto-char (point-min))
+    (let ((last-command-event ?q))
+      (call-interactively (key-binding (kbd "q"))))
+    (should (= (point) (point-max)))
+    (should (equal (buffer-substring-no-properties
+                    fermium-room--input-start (point-max))
+                   "q"))))
 
 (ert-deftest fermium-overview-q-quits-fermium ()
   (should (eq (lookup-key fermium-overview-mode-map (kbd "q"))

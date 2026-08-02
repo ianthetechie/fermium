@@ -274,6 +274,8 @@ coloring, or replace it with a custom list of faces."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "?") #'fermium-help)
     (define-key map (kbd "TAB") #'fermium-room-toggle-header-or-channel-events)
+    (define-key map [remap self-insert-command]
+                #'fermium-room--redirect-self-insert)
     map)
   "Keymap used by the read-only part of a room buffer.")
 
@@ -2377,6 +2379,17 @@ buffers can still be created while a room's name is being resolved."
 
 (defun fermium-room--composition-after-change (&rest _)
   (fermium-room--ensure-composition-overlay))
+
+(defun fermium-room--redirect-self-insert (count)
+  "Insert typed text at the end of the room composition.
+
+This is used by the read-only area's keymap, so typing while point is in
+history moves point to the writable composition instead of attempting to
+modify history."
+  (interactive "p")
+  (when fermium-room--input-start
+    (goto-char (point-max))
+    (self-insert-command count)))
 
 (defun fermium-room--add-face-properties (start end face)
   "Apply FACE to the room text between START and END.
