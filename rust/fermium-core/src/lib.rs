@@ -201,6 +201,8 @@ pub struct MessageSummary {
     pub kind: MessageKind,
     pub event_id: String,
     pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
     pub body: String,
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +383,22 @@ mod tests {
         assert!(room_event.contains("\"type\":\"room_updated\""));
         assert!(room_event.contains("!room:example.org"));
         assert!(room_event.contains("\"has_unread\":false"));
+    }
+
+    #[test]
+    fn message_summary_serializes_an_optional_sender_display_name() {
+        let message = MessageSummary {
+            kind: MessageKind::Message,
+            event_id: "$event:example.org".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            sender_display_name: Some("Alice".to_owned()),
+            body: "Hello".to_owned(),
+            timestamp: 1_000,
+            image: None,
+        };
+
+        let encoded = serde_json::to_string(&message).expect("message should encode");
+        assert!(encoded.contains("\"sender_display_name\":\"Alice\""));
     }
 
     #[test]

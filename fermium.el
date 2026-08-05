@@ -38,6 +38,9 @@ When nil, use the development helper under this package's workspace."
   :type 'string
   :group 'fermium)
 
+(defconst fermium-room-unknown-user-label "<UNKNOWN USER>"
+  "Label used when a message has neither a display name nor a sender ID.")
+
 (defface fermium-room-title-face
   '((t (:inherit header-line :weight bold :height 1.2 :box nil)))
   "Face used for a room's title."
@@ -2423,7 +2426,16 @@ for the text returned by the fixed room header's mode-line formatter."
   "Return the display label for MESSAGE's sender."
   (if (eq (fermium-room--message-sender-role message) 'self)
       "me"
-    (or (fermium-room--message-sender-id message) "")))
+    (or (let ((display-name (fermium--event-value message
+                                                  "sender_display_name")))
+          (and (stringp display-name)
+               (not (string-empty-p display-name))
+               display-name))
+        (let ((sender-id (fermium-room--message-sender-id message)))
+          (and (stringp sender-id)
+               (not (string-empty-p sender-id))
+               sender-id))
+        fermium-room-unknown-user-label)))
 
 (defun fermium-room--message-sender-color-face (message)
   "Return the stable palette face for MESSAGE's other sender."

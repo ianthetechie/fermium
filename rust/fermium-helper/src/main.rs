@@ -32,6 +32,7 @@ use matrix_sdk::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             room::{
                 MediaSource,
+                member::MembershipState,
                 message::{MessageType, OriginalSyncRoomMessageEvent},
             },
         },
@@ -48,6 +49,7 @@ use url::Url;
 type EventSender = mpsc::Sender<Event>;
 type SharedSessions = Arc<Mutex<HashMap<String, Session>>>;
 type SharedPendingLogins = Arc<Mutex<HashMap<u64, PendingLogin>>>;
+type SharedRoomMemberContexts = Arc<Mutex<HashMap<String, RoomMemberContext>>>;
 
 struct Session {
     client: Client,
@@ -55,6 +57,14 @@ struct Session {
     store_key: String,
     initial_sync_complete: Arc<AtomicBool>,
     connection_state: Arc<Mutex<ConnectionState>>,
+    room_member_contexts: SharedRoomMemberContexts,
+}
+
+#[derive(Clone, Default)]
+struct RoomMemberContext {
+    names: Vec<String>,
+    display_names: HashMap<String, String>,
+    members_synced: bool,
 }
 
 #[derive(Clone, Default)]
@@ -408,7 +418,14 @@ async fn list_state(
     events: &EventSender,
     request_id: u64,
 ) -> Result<()> {
-    let clients: Vec<(String, String, Client, bool, ConnectionState)> = {
+    let clients: Vec<(
+        String,
+        String,
+        Client,
+        bool,
+        ConnectionState,
+        SharedRoomMemberContexts,
+    )> = {
         let sessions = sessions.lock().await;
         let mut clients = Vec::with_capacity(sessions.len());
         for (user_id, session) in sessions.iter() {
@@ -418,18 +435,29 @@ async fn list_state(
                 session.client.clone(),
                 session.initial_sync_complete.load(Ordering::Acquire),
                 session.connection_state.lock().await.clone(),
+                Arc::clone(&session.room_member_contexts),
             ));
         }
         clients
     };
     let mut clients = clients;
     clients.sort_by(|left, right| left.0.cmp(&right.0));
-    let enrichment_clients: Vec<(String, Client)> = clients
+    let enrichment_clients: Vec<(String, Client, SharedRoomMemberContexts)> = clients
         .iter()
-        .map(|(account, _, client, _, _)| (account.clone(), client.clone()))
+        .map(|(account, _, client, _, _, contexts)| {
+            (account.clone(), client.clone(), Arc::clone(contexts))
+        })
         .collect();
     let mut accounts = Vec::with_capacity(clients.len());
-    for (user_id, homeserver, client, initial_sync_complete, connection_state) in clients {
+    for (
+        user_id,
+        homeserver,
+        client,
+        initial_sync_complete,
+        connection_state,
+        _room_member_contexts,
+    ) in clients
+    {
         accounts.push(AccountSummary {
             user_id,
             homeserver,
@@ -447,8 +475,8 @@ async fn list_state(
         })
         .await
         .context("sending state response")?;
-    for (account, client) in enrichment_clients {
-        spawn_room_enrichment(&client, events, &account);
+    for (account, client, room_member_contexts) in enrichment_clients {
+        spawn_room_enrichment(&client, events, &account, &room_member_contexts);
     }
     Ok(())
 }
@@ -460,19 +488,22 @@ async fn open_room(
     account: String,
     room_id: String,
 ) -> Result<()> {
-    let client = session_client(sessions, &account).await?;
+    let (client, room_member_contexts) =
+        session_client_and_room_member_contexts(sessions, &account).await?;
     let room_id = RoomId::parse(&room_id).context("room ID is invalid")?;
     let room = client
         .get_room(&room_id)
         .ok_or_else(|| anyhow!("room is not joined"))?;
-    let room_summary = room_summary(&room).await;
-    let messages = room
+    let room_member_context = cached_room_member_context(&room, &room_member_contexts).await;
+    let room_summary = room_summary(&room, &room_member_context).await;
+    let timeline = room
         .messages(MessagesOptions::backward())
         .await
         .context("loading room messages")?
-        .chunk
+        .chunk;
+    let messages = timeline
         .iter()
-        .filter_map(message_from_timeline)
+        .filter_map(|event| message_from_timeline(&room_member_context.display_names, event))
         .collect();
 
     events
@@ -547,11 +578,13 @@ async fn send_message(
         return Err(anyhow!("message body cannot be empty"));
     }
 
-    let client = session_client(sessions, &account).await?;
+    let (client, room_member_contexts) =
+        session_client_and_room_member_contexts(sessions, &account).await?;
     let room_id = RoomId::parse(&room_id).context("room ID is invalid")?;
     let room = client
         .get_room(&room_id)
         .ok_or_else(|| anyhow!("room is not joined"))?;
+    let room_member_context = cached_room_member_context(&room, &room_member_contexts).await;
 
     events
         .send(Event::MessagePending {
@@ -571,10 +604,11 @@ async fn send_message(
         .await
         .context("sending Matrix message")?;
 
-    let sender = client
+    let sender_id = client
         .user_id()
-        .ok_or_else(|| anyhow!("logged-in Matrix client has no user ID"))?
-        .to_string();
+        .ok_or_else(|| anyhow!("logged-in Matrix client has no user ID"))?;
+    let sender = sender_id.to_string();
+    let sender_display_name = room_member_context.display_names.get(&sender).cloned();
     events
         .send(Event::Message {
             account: account.clone(),
@@ -583,6 +617,7 @@ async fn send_message(
                 kind: MessageKind::Message,
                 event_id: response.response.event_id.to_string(),
                 sender,
+                sender_display_name,
                 body,
                 timestamp: current_timestamp_millis(),
                 image: None,
@@ -641,6 +676,23 @@ async fn session_client(sessions: &SharedSessions, account: &str) -> Result<Clie
         .ok_or_else(|| anyhow!("Matrix account {account} is not logged in"))
 }
 
+async fn session_client_and_room_member_contexts(
+    sessions: &SharedSessions,
+    account: &str,
+) -> Result<(Client, SharedRoomMemberContexts)> {
+    sessions
+        .lock()
+        .await
+        .get(account)
+        .map(|session| {
+            (
+                session.client.clone(),
+                Arc::clone(&session.room_member_contexts),
+            )
+        })
+        .ok_or_else(|| anyhow!("Matrix account {account} is not logged in"))
+}
+
 fn fast_room_summaries(client: &Client) -> Vec<RoomSummary> {
     client
         .joined_rooms()
@@ -669,11 +721,11 @@ fn room_summary_fast(room: &Room) -> RoomSummary {
     }
 }
 
-async fn room_summary(room: &Room) -> RoomSummary {
+async fn room_summary(room: &Room, room_member_context: &RoomMemberContext) -> RoomSummary {
     let info = room.clone_info();
     let is_dm = room.compute_is_dm().await.unwrap_or_else(|_| room.is_dm());
     let members = if is_dm {
-        room_member_names(room).await
+        room_member_context.names.clone()
     } else {
         Vec::new()
     };
@@ -683,7 +735,7 @@ async fn room_summary(room: &Room) -> RoomSummary {
     } else {
         members.join(", ")
     };
-    let latest_message = room_latest_message(room).await;
+    let latest_message = room_latest_message(room, room_member_context).await;
     let last_activity_timestamp = [
         room.latest_event_timestamp()
             .map(|timestamp| i64::from(timestamp.get())),
@@ -710,40 +762,89 @@ fn room_has_unread(room: &Room) -> bool {
     room.unread_notification_counts().notification_count > 0 || room.is_marked_unread()
 }
 
-async fn room_latest_message(room: &Room) -> Option<MessageSummary> {
+async fn room_latest_message(
+    room: &Room,
+    room_member_context: &RoomMemberContext,
+) -> Option<MessageSummary> {
     let messages = room.messages(MessagesOptions::backward()).await.ok()?;
     messages
         .chunk
         .iter()
-        .filter_map(message_from_timeline)
+        .filter_map(|event| message_from_timeline(&room_member_context.display_names, event))
         .max_by_key(|message| message.timestamp)
 }
 
-async fn room_member_names(room: &Room) -> Vec<String> {
-    let mut names: Vec<String> = room
-        .members_no_sync(RoomMemberships::JOIN)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|member| !member.is_account_user())
-        .map(|member| member.name().to_owned())
-        .collect();
+async fn cached_room_member_context(
+    room: &Room,
+    contexts: &SharedRoomMemberContexts,
+) -> RoomMemberContext {
+    let room_id = room.room_id().to_string();
+    if let Some(context) = contexts.lock().await.get(&room_id).cloned() {
+        // Do not retry a failed/incomplete lazy load for every message. The
+        // cache is retried only when the SDK reports that member sync state
+        // has changed.
+        if context.members_synced == room.are_members_synced() {
+            return context;
+        }
+    }
 
-    if names.is_empty() {
-        names = room
+    // A full load is needed once for lazy-loaded rooms. Subsequent messages
+    // use the cached snapshot rather than asking the SDK for a member again.
+    let context = load_room_member_context(room, true).await;
+    contexts.lock().await.insert(room_id, context.clone());
+    context
+}
+
+async fn load_room_member_context(room: &Room, sync_members: bool) -> RoomMemberContext {
+    // Member-state events already update the SDK store, so refreshing from the
+    // local store is enough on that path. The initial/cache-miss path uses the
+    // syncing variant to fill in lazy-loaded members once.
+    let members = if sync_members {
+        room.members(RoomMemberships::empty()).await
+    } else {
+        room.members_no_sync(RoomMemberships::empty()).await
+    }
+    .unwrap_or_default();
+    let mut context = RoomMemberContext::default();
+
+    for member in members {
+        let member_id = member.user_id().to_string();
+        if let Some(display_name) = member
+            .display_name()
+            .filter(|display_name| !display_name.is_empty())
+        {
+            context
+                .display_names
+                .insert(member_id, display_name.to_owned());
+        }
+        if member.membership() == &MembershipState::Join && !member.is_account_user() {
+            context.names.push(member.name().to_owned());
+        }
+    }
+
+    if context.names.is_empty() {
+        for hero in room
             .heroes()
             .into_iter()
             .filter(|hero| hero.user_id != room.own_user_id())
-            .map(|hero| {
-                hero.display_name
-                    .unwrap_or_else(|| hero.user_id.localpart().to_owned())
-            })
-            .collect();
+        {
+            let hero_id = hero.user_id.to_string();
+            if let Some(display_name) = hero
+                .display_name
+                .filter(|display_name| !display_name.is_empty())
+            {
+                context.display_names.insert(hero_id, display_name.clone());
+                context.names.push(display_name);
+            } else {
+                context.names.push(hero.user_id.localpart().to_owned());
+            }
+        }
     }
 
-    names.sort_unstable();
-    names.dedup();
-    names
+    context.names.sort_unstable();
+    context.names.dedup();
+    context.members_synced = room.are_members_synced();
+    context
 }
 
 async fn build_client_with_store(homeserver: &str, store_key: &str) -> Result<Client> {
@@ -794,13 +895,17 @@ async fn activate_session(
     }
 
     let account = user_id.clone();
+    let room_member_contexts = Arc::new(Mutex::new(HashMap::new()));
 
     let event_tx = events.clone();
     let event_account = account.clone();
+    let event_room_member_contexts = Arc::clone(&room_member_contexts);
     client.add_event_handler(move |event: Raw<AnySyncTimelineEvent>, room: Room| {
         let event_tx = event_tx.clone();
         let account = event_account.clone();
+        let room_member_contexts = Arc::clone(&event_room_member_contexts);
         async move {
+            let room_id = room.room_id().to_string();
             if room.state() == RoomState::Joined {
                 let _ = event_tx
                     .send(Event::RoomUpdated {
@@ -809,10 +914,11 @@ async fn activate_session(
                     })
                     .await;
             } else {
+                room_member_contexts.lock().await.remove(&room_id);
                 let _ = event_tx
                     .send(Event::RoomRemoved {
                         account: account.clone(),
-                        room_id: room.room_id().to_string(),
+                        room_id: room_id.clone(),
                     })
                     .await;
             }
@@ -822,24 +928,37 @@ async fn activate_session(
                     AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                         event,
                     )) => {
+                        let room_member_context =
+                            cached_room_member_context(&room, &room_member_contexts).await;
                         if let Some(event) = event.as_original()
-                            && let Some(message) = message_from_original(event)
+                            && let Some(message) =
+                                message_from_original(&room_member_context.display_names, event)
                         {
                             let _ = event_tx
                                 .send(Event::Message {
                                     account,
-                                    room_id: room.room_id().to_string(),
+                                    room_id,
                                     message,
                                 })
                                 .await;
                         }
                     }
                     AnySyncTimelineEvent::State(event) => {
+                        if matches!(
+                            &event,
+                            matrix_sdk::ruma::events::AnySyncStateEvent::RoomMember(_)
+                        ) {
+                            let room_member_context = load_room_member_context(&room, false).await;
+                            room_member_contexts
+                                .lock()
+                                .await
+                                .insert(room_id.clone(), room_member_context);
+                        }
                         if let Some(message) = channel_event_from_state(event) {
                             let _ = event_tx
                                 .send(Event::Message {
                                     account,
-                                    room_id: room.room_id().to_string(),
+                                    room_id,
                                     message,
                                 })
                                 .await;
@@ -869,6 +988,7 @@ async fn activate_session(
             store_key,
             initial_sync_complete: Arc::clone(&initial_sync_complete),
             connection_state: Arc::clone(&connection_state),
+            room_member_contexts: Arc::clone(&room_member_contexts),
         },
     );
 
@@ -919,6 +1039,7 @@ async fn activate_session(
         account.clone(),
         initial_sync_complete,
         connection_state,
+        room_member_contexts,
     ));
     if let Some(session) = sessions.lock().await.get_mut(&account) {
         session.sync_task = Some(sync_task);
@@ -938,12 +1059,20 @@ async fn send_fast_room_summaries(client: &Client, events: &EventSender, account
     }
 }
 
-fn spawn_room_enrichment(client: &Client, events: &EventSender, account: &str) {
+fn spawn_room_enrichment(
+    client: &Client,
+    events: &EventSender,
+    account: &str,
+    room_member_contexts: &SharedRoomMemberContexts,
+) {
     for room in client.joined_rooms() {
         let events = events.clone();
         let account = account.to_owned();
+        let room_member_contexts = Arc::clone(room_member_contexts);
         tokio::spawn(async move {
-            let room = room_summary(&room).await;
+            let room_member_context =
+                cached_room_member_context(&room, &room_member_contexts).await;
+            let room = room_summary(&room, &room_member_context).await;
             let _ = events.send(Event::RoomUpdated { account, room }).await;
         });
     }
@@ -955,6 +1084,7 @@ async fn sync_forever(
     account: String,
     initial_sync_complete: Arc<AtomicBool>,
     connection_state: Arc<Mutex<ConnectionState>>,
+    room_member_contexts: SharedRoomMemberContexts,
 ) {
     // `Client::sync` returns on the first error.  Consume errors in the
     // callback instead so the SDK's sync stream can retry after a temporary
@@ -978,7 +1108,7 @@ async fn sync_forever(
     } else {
         initial_sync_complete.store(true, Ordering::Release);
         send_fast_room_summaries(&client, &events, &account).await;
-        spawn_room_enrichment(&client, &events, &account);
+        spawn_room_enrichment(&client, &events, &account, &room_member_contexts);
         fermium_set_connection_status(
             &events,
             &connection_state,
@@ -994,6 +1124,7 @@ async fn sync_forever(
     let callback_account = account.clone();
     let callback_client = client.clone();
     let callback_initial_sync_complete = Arc::clone(&initial_sync_complete);
+    let callback_room_member_contexts = Arc::clone(&room_member_contexts);
     let result = client
         .sync_with_result_callback(SyncSettings::default(), |result| {
             let events = events.clone();
@@ -1002,12 +1133,18 @@ async fn sync_forever(
             let client = callback_client.clone();
             let initial_sync_complete = Arc::clone(&callback_initial_sync_complete);
             let connection_state = Arc::clone(&connection_state);
+            let room_member_contexts = Arc::clone(&callback_room_member_contexts);
             async move {
                 match result {
                     Ok(_) => {
                         if !initial_sync_complete.swap(true, Ordering::AcqRel) {
                             send_fast_room_summaries(&client, &events, &account).await;
-                            spawn_room_enrichment(&client, &events, &account);
+                            spawn_room_enrichment(
+                                &client,
+                                &events,
+                                &account,
+                                &room_member_contexts,
+                            );
                         }
                         online.store(true, Ordering::Release);
                         fermium_set_connection_status(
@@ -1192,18 +1329,24 @@ async fn save_persisted_sessions(sessions: &SharedSessions) -> Result<()> {
     Ok(())
 }
 
-fn message_from_timeline(event: &TimelineEvent) -> Option<MessageSummary> {
+fn message_from_timeline(
+    display_names: &HashMap<String, String>,
+    event: &TimelineEvent,
+) -> Option<MessageSummary> {
     let event: AnySyncTimelineEvent = event.raw().deserialize().ok()?;
     match event {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(event)) => {
-            message_from_original(event.as_original()?)
+            message_from_original(display_names, event.as_original()?)
         }
         AnySyncTimelineEvent::State(event) => channel_event_from_state(event),
         AnySyncTimelineEvent::MessageLike(_) => None,
     }
 }
 
-fn message_from_original(event: &OriginalSyncRoomMessageEvent) -> Option<MessageSummary> {
+fn message_from_original(
+    display_names: &HashMap<String, String>,
+    event: &OriginalSyncRoomMessageEvent,
+) -> Option<MessageSummary> {
     let (kind, body, image) = match &event.content.msgtype {
         MessageType::Text(text) => (MessageKind::Message, text.body.clone(), None),
         MessageType::Notice(notice) => (MessageKind::Message, notice.body.clone(), None),
@@ -1224,10 +1367,12 @@ fn message_from_original(event: &OriginalSyncRoomMessageEvent) -> Option<Message
         }
         _ => return None,
     };
+    let sender = event.sender.to_string();
     Some(MessageSummary {
         kind,
         event_id: event.event_id.to_string(),
-        sender: event.sender.to_string(),
+        sender_display_name: display_names.get(&sender).cloned(),
+        sender,
         body,
         timestamp: event
             .origin_server_ts
@@ -1370,6 +1515,7 @@ fn channel_event(event_id: String, body: String, timestamp: i64) -> MessageSumma
         kind: MessageKind::ChannelEvent,
         event_id,
         sender: String::new(),
+        sender_display_name: None,
         body,
         timestamp,
         image: None,

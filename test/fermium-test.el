@@ -1646,6 +1646,37 @@
       (should (eq (overlay-get fermium-room--composition-overlay 'face)
                   'fermium-room-composition-face)))))
 
+(ert-deftest fermium-room-renders-sender-display-name-when-present ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (setq fermium-room--account-id "@alice:example.org")
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org"))
+     (list (list (cons "sender" "@bob:example.org")
+                 (cons "sender_display_name" "Bob")
+                 (cons "body" "hello")
+                 (cons "timestamp" 0))))
+    (should (string-match-p
+             (regexp-quote
+              (format "%s Bob: hello" (fermium-room--format-timestamp 0)))
+             (buffer-string)))
+    (should-not (string-match-p "@bob:example.org:" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "Bob")
+    (should (equal (get-text-property (1- (point)) 'fermium-room-sender-id)
+                   "@bob:example.org"))))
+
+(ert-deftest fermium-room-uses-an-explicit-unknown-user-label ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (should (equal (fermium-room--message-sender-label nil)
+                   fermium-room-unknown-user-label))
+    (should (equal
+             (fermium-room--message-sender-label
+              (list (cons "sender" "")
+                    (cons "sender_display_name" "")))
+             fermium-room-unknown-user-label))))
+
 (ert-deftest fermium-room-styles-survive-font-lock-unfontification ()
   (with-temp-buffer
     (fermium-room-mode)
