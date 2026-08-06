@@ -378,19 +378,19 @@ coloring, or replace it with a custom list of faces."
   (let ((event-type (or event-type fermium--handling-event-type))
         (request-id (or request-id fermium--handling-event-request-id)))
     (let ((description
-         (format
-          "%s failed%s%s%s: %s"
-          where
-          (if event-type
-              (format " for %s event" event-type)
-            "")
-          (if request-id
-              (format " (request %s)" request-id)
-            "")
-          (if (derived-mode-p 'fermium-room-mode)
-              (format " in buffer %s" (buffer-name))
-            "")
-          (error-message-string error))))
+           (format
+            "%s failed%s%s%s: %s"
+            where
+            (if event-type
+                (format " for %s event" event-type)
+              "")
+            (if request-id
+                (format " (request %s)" request-id)
+              "")
+            (if (derived-mode-p 'fermium-room-mode)
+                (format " in buffer %s" (buffer-name))
+              "")
+            (error-message-string error))))
       (setq fermium--last-elisp-error description)
       (message "Fermium: %s" description))))
 
@@ -546,7 +546,7 @@ coloring, or replace it with a custom list of faces."
         (process-send-string
          fermium--process
          (concat
-           (json-serialize
+          (json-serialize
            (mapcar (lambda (pair)
                      (cons (intern (car pair))
                            (fermium--json-value-for-send (cdr pair))))
@@ -921,7 +921,7 @@ buffers can still be created while a room's name is being resolved."
       (with-current-buffer buffer
         (fermium-overview-mode)
         (fermium--render-overview))
-      (pop-to-buffer buffer))))
+      (switch-to-buffer buffer))))
 
 (defun fermium-login ()
   "Log in to a Matrix homeserver using auth-source credentials."
@@ -1024,14 +1024,14 @@ buffers can still be created while a room's name is being resolved."
   (let ((prompt (format "Account to %s: " (or action "use")))
         (accounts (fermium--account-ids)))
     (completing-read prompt
-                   accounts
-                   nil
-                   t
-                   nil
-                   nil
-                   (or (and (member fermium--account accounts)
-                            fermium--account)
-                       (car accounts)))))
+                     accounts
+                     nil
+                     t
+                     nil
+                     nil
+                     (or (and (member fermium--account accounts)
+                              fermium--account)
+                         (car accounts)))))
 
 (defun fermium--handle-device-verification (event account)
   "Report the result of verifying ACCOUNT from helper EVENT."
@@ -1045,8 +1045,8 @@ buffers can still be created while a room's name is being resolved."
   "Show actions for SELECTED-ACCOUNT, or the account at point."
   (interactive)
   (let ((account (or selected-account
-                    (get-text-property (point) 'fermium-account-id)
-                    fermium--account)))
+                     (get-text-property (point) 'fermium-account-id)
+                     fermium--account)))
     (if (and account (fermium--pending-login-record account))
         (message "Fermium: login for %s is still in progress" account)
       (pcase (read-char-choice
@@ -1065,8 +1065,8 @@ buffers can still be created while a room's name is being resolved."
   "Log out of SELECTED-ACCOUNT, or prompt for an account."
   (interactive)
   (let ((account (or selected-account
-                    (and (fermium--account-ids)
-                         (fermium--select-account "log out")))))
+                     (and (fermium--account-ids)
+                          (fermium--select-account "log out")))))
     (cond
      ((not account)
       (message "Fermium: no logged-in account to log out"))
@@ -1552,8 +1552,8 @@ buffers can still be created while a room's name is being resolved."
 (defun fermium--overview-insert-rooms-section
     (account-id &optional rooms rooms-loading)
   (let ((rooms (if account-id
-                  (or rooms (fermium--rooms-for-account account-id))
-                (or rooms fermium--rooms))))
+                   (or rooms (fermium--rooms-for-account account-id))
+                 (or rooms fermium--rooms))))
     (fermium--overview-insert-section
      'rooms
      (if rooms-loading
@@ -1634,13 +1634,13 @@ buffers can still be created while a room's name is being resolved."
                                 t))
                         (cons "connection_status"
                               (fermium--event-value event
-                                                     "connection_status"))
+                                                    "connection_status"))
                         (cons "last_sync_timestamp"
                               (fermium--event-value event
-                                                     "last_sync_timestamp"))
+                                                    "last_sync_timestamp"))
                         (cons "connection_error"
                               (fermium--event-value event
-                                                     "connection_error")))))
+                                                    "connection_error")))))
     (fermium--remove-pending-login account-id)
     (fermium--upsert-account-summary account)
     (fermium--set-selected-account account-id))
@@ -2026,7 +2026,7 @@ buffers can still be created while a room's name is being resolved."
            (cache-key (list text width line-height font-size font-family
                             (frame-parameter frame 'background-mode)))
            (svg (or (and (equal cache-key fermium-room--header-image-cache-key)
-                        fermium-room--header-image-cache)
+                         fermium-room--header-image-cache)
                     (let ((image (svg-create width height)))
                       (cl-loop for line in lines
                                for row from 0
@@ -2665,7 +2665,7 @@ that a header click cannot fall through to PRIMARY-selection insertion."
           (let ((key (get-text-property (point) 'fermium-room-image-key)))
             (if (and key
                      (eq (plist-get (gethash key fermium-room--image-states)
-                                   :status)
+                                    :status)
                          'loading))
                 (let* ((start (point))
                        (end (next-single-property-change
@@ -2925,22 +2925,22 @@ stable reference time."
 (defun fermium-room--insert-message (message)
   (unless (fermium-room--message-seen-p message)
     (let* ((start (point))
-          (timestamp-start (point))
-          (sender-start nil)
-          (body-start nil)
-          (timestamp-value (fermium-room--message-timestamp message))
-          (timestamp nil)
-          (body-end nil)
-          (sender-id (fermium-room--message-sender-id message))
-          (sender-role (fermium-room--message-sender-role message))
-          (sender-label (fermium-room--message-sender-label message))
-          (sender-face (fermium-room--message-sender-face message))
-          (image (fermium--event-value message "image"))
-          (image-key (and image (fermium-room--message-key message)))
-          (image-source (and image
-                             (fermium--event-value image "source")))
-          (image-state (and image-key
-                            (gethash image-key fermium-room--image-states))))
+           (timestamp-start (point))
+           (sender-start nil)
+           (body-start nil)
+           (timestamp-value (fermium-room--message-timestamp message))
+           (timestamp nil)
+           (body-end nil)
+           (sender-id (fermium-room--message-sender-id message))
+           (sender-role (fermium-room--message-sender-role message))
+           (sender-label (fermium-room--message-sender-label message))
+           (sender-face (fermium-room--message-sender-face message))
+           (image (fermium--event-value message "image"))
+           (image-key (and image (fermium-room--message-key message)))
+           (image-source (and image
+                              (fermium--event-value image "source")))
+           (image-state (and image-key
+                             (gethash image-key fermium-room--image-states))))
       (setq timestamp
             (fermium-room--format-timestamp timestamp-value))
       (insert timestamp)
@@ -3056,7 +3056,7 @@ stable reference time."
     (dolist (room (if account-id
                       (fermium--rooms-for-account account-id)
                     fermium--rooms)
-                 updated)
+                  updated)
       (when (equal room-id (fermium--event-value room "room_id"))
         (let ((current-timestamp
                (max (or (fermium--event-value room "last_activity_timestamp") 0)
