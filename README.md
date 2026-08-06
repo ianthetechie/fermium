@@ -19,10 +19,18 @@ cargo build
 
 ## Emacs configuration
 
+If you have it pre-built:
+
 ``` emacs-lisp
 (add-to-list 'load-path "/path/to/fermium-el")
 (require 'fermium)
 (global-set-key (kbd "C-c f") #'fermium)
+```
+
+For development, you can also more easily just run this:
+
+``` shell
+just dev-reload
 ```
 
 ## Themes and face customization
