@@ -910,6 +910,70 @@
       (when (buffer-live-p source)
         (kill-buffer source)))))
 
+(ert-deftest fermium-room-overview-reuses-the-session-and-current-window ()
+  (let ((source (generate-new-buffer " *Fermium room navigation source*"))
+        overview
+        (process-count 0)
+        live-process)
+    (unwind-protect
+        (progn
+          (switch-to-buffer source)
+          (fermium-room-mode)
+          (let ((window (selected-window))
+                (fermium-helper-program "fermium-test-helper")
+                (fermium--process nil)
+                (fermium--pending-requests (make-hash-table :test #'eql)))
+            (cl-letf (((symbol-function 'process-live-p)
+                       (lambda (process)
+                         (and process (eq process live-process))))
+                      ((symbol-function 'make-process)
+                       (lambda (&rest _args)
+                         (setq live-process (list :process (cl-incf process-count)))
+                         live-process))
+                      ((symbol-function 'fermium--request-state)
+                       (lambda () nil)))
+              (fermium)
+              (let ((first-overview (get-buffer fermium--overview-buffer)))
+                (should first-overview)
+                (fermium)
+                (should (eq (get-buffer fermium--overview-buffer)
+                            first-overview))
+                (kill-buffer first-overview)
+                (switch-to-buffer source)
+                (fermium-room-overview)
+                (setq overview (get-buffer fermium--overview-buffer))
+                (should (eq (selected-window) window))
+                (should (eq (window-buffer window) overview))
+                (should (= process-count 1))
+                (should (= 1
+                           (cl-count fermium--overview-buffer
+                                     (buffer-list)
+                                     :key #'buffer-name
+                                     :test #'equal)))))))
+      (when (buffer-live-p overview)
+        (kill-buffer overview))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
+
+(ert-deftest fermium-room-overview-is-bound-in-room-buffers ()
+  (should (eq (lookup-key fermium-room-mode-map (kbd "C-c o"))
+              #'fermium-room-overview))
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org")) nil)
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "C-c o")) #'fermium-room-overview)))
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org")) nil)
+    (goto-char fermium-room--input-start)
+    (insert "draft")
+    (should (eq (overlay-get fermium-room--composition-overlay 'keymap)
+                fermium-room-mode-map))
+    (should (eq (key-binding (kbd "C-c o")) #'fermium-room-overview))))
+
 (ert-deftest fermium-open-room-cleans-up-an-existing-room-buffer ()
   (let ((overview (generate-new-buffer " *Fermium existing room overview*"))
         (room (get-buffer-create "*Fermium: !room:example.org*"))

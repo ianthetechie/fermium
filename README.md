@@ -54,6 +54,7 @@ You can press `?` in the overview to access help.
 You can navigate between items with `n` and `p`,
 and fold/unfold sections with `TAB`.
 `RET` on a room opens a room buffer where you can view and compose messages.
+In a room, `C-c o` returns to the overview in the same window.
 
 ## Themes and face customization
 

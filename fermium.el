@@ -266,6 +266,7 @@ coloring, or replace it with a custom list of faces."
 (defvar fermium-room-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map text-mode-map)
+    (define-key map (kbd "C-c o") #'fermium-room-overview)
     (define-key map (kbd "C-c C-c") #'fermium-room-send)
     (define-key map (kbd "C-c C-k") #'fermium-room-clear-input)
     (define-key map (kbd "TAB") #'fermium-room-toggle-header-or-channel-events)
@@ -275,6 +276,7 @@ coloring, or replace it with a custom list of faces."
 
 (defvar fermium-room--read-only-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c o") #'fermium-room-overview)
     (define-key map (kbd "?") #'fermium-help)
     (define-key map (kbd "TAB") #'fermium-room-toggle-header-or-channel-events)
     (define-key map [remap self-insert-command]
@@ -910,9 +912,8 @@ buffers can still be created while a room's name is being resolved."
                         (fermium--event-value event "message")))
       ("connection_status" (fermium--handle-connection-status event)))))
 
-(defun fermium ()
-  "Open the Fermium overview buffer."
-  (interactive)
+(defun fermium--open-overview ()
+  "Open the canonical Fermium overview in the current window."
   (let ((new-process (not (process-live-p fermium--process))))
     (fermium--ensure-process)
     (when new-process
@@ -921,7 +922,18 @@ buffers can still be created while a room's name is being resolved."
       (with-current-buffer buffer
         (fermium-overview-mode)
         (fermium--render-overview))
-      (switch-to-buffer buffer))))
+      (switch-to-buffer buffer)
+      buffer)))
+
+(defun fermium ()
+  "Open the Fermium overview buffer."
+  (interactive)
+  (fermium--open-overview))
+
+(defun fermium-room-overview ()
+  "Return from the current room to the Fermium overview."
+  (interactive)
+  (fermium--open-overview))
 
 (defun fermium-login ()
   "Log in to a Matrix homeserver using auth-source credentials."
@@ -1537,6 +1549,7 @@ buffers can still be created while a room's name is being resolved."
 (transient-define-prefix fermium--room-help ()
   "Fermium room commands."
   ["Room"
+   ("C-c o" "return to the overview" fermium-room-overview)
    ("TAB" "collapse or expand header or channel events"
     fermium-room-toggle-header-or-channel-events)
    ("C-c C-c" "send the message" fermium-room-send)
@@ -2377,6 +2390,8 @@ buffers can still be created while a room's name is being resolved."
                  'face (if fermium-room--sending
                            'fermium-room-composition-sending-face
                          'fermium-room-composition-face))
+    (overlay-put fermium-room--composition-overlay
+                 'keymap fermium-room-mode-map)
     (move-overlay fermium-room--composition-overlay
                   fermium-room--input-start (point-max))))
 
