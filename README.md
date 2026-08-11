@@ -3,10 +3,7 @@
 A Matrix client for Emacs.
 UI and glue via elisp, with the heavy lifting by the Rust Matrix SDK.
 
-The Rust Matrix SDK interaction happens via a child process (max of one per Emacs session).
-It uses NDJSON over inherited stdin/stdout pipes.
-This is reasonably secure from other processes on the machine, but of course you should trust other elisp in your environment.
-Data storage is handled by the [Rust Matrix SDK](https://github.com/matrix-org/matrix-rust-sdk).
+![Screenshot](screenshot.png)
 
 ## Getting started
 
@@ -33,7 +30,6 @@ For development, you can also more easily just run this:
 ``` shell
 just dev-reload
 ```
-
 
 ## Logging in
 
