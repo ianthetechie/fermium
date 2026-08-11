@@ -33,10 +33,45 @@ When nil, use the development helper under this package's workspace."
   :type 'file
   :group 'fermium)
 
+(defcustom fermium-initial-sync-timeout 300
+  "Maximum number of seconds allowed for an initial Matrix sync.
+
+This setting is read when the Rust helper process starts.  It is deliberately
+longer than the normal sync long-poll because some homeservers take a while to
+construct the first complete response."
+  :type 'natnum
+  :group 'fermium)
+
+(defcustom fermium-sync-long-poll-timeout nil
+  "Maximum number of seconds a Matrix sync long-poll may wait.
+
+When nil, use the Matrix SDK default.  This setting is read when the Rust
+helper process starts."
+  :type '(choice (const :tag "Matrix SDK default" nil)
+                 (natnum :tag "Seconds"))
+  :group 'fermium)
+
 (defcustom fermium-auth-source-port "matrix"
   "Auth-source port/service used for Matrix credentials."
   :type 'string
   :group 'fermium)
+
+(defun fermium--helper-environment ()
+  "Return the environment for the helper process."
+  (let ((environment
+         (cl-remove-if
+          (lambda (entry)
+            (or (string-prefix-p "FERMIUM_INITIAL_SYNC_TIMEOUT=" entry)
+                (string-prefix-p "FERMIUM_SYNC_TIMEOUT=" entry)))
+          process-environment)))
+    (push (format "FERMIUM_INITIAL_SYNC_TIMEOUT=%d"
+                  fermium-initial-sync-timeout)
+          environment)
+    (when fermium-sync-long-poll-timeout
+      (push (format "FERMIUM_SYNC_TIMEOUT=%d"
+                    fermium-sync-long-poll-timeout)
+            environment))
+    environment))
 
 (defconst fermium-room-unknown-user-label "<UNKNOWN USER>"
   "Label used when a message has neither a display name nor a sender ID.")
@@ -485,15 +520,16 @@ coloring, or replace it with a custom list of faces."
       (fermium--reset-room-send-state))
     (setq fermium--stopping nil)
     (setq fermium--process-output "")
-    (setq fermium--process
-          (make-process
-           :name "fermium-helper"
-           :command (list (fermium--helper-program))
-           :connection-type 'pipe
-           :coding 'utf-8
-           :noquery t
-           :filter #'fermium--process-filter
-           :sentinel #'fermium--process-sentinel))))
+    (let ((process-environment (fermium--helper-environment)))
+      (setq fermium--process
+            (make-process
+             :name "fermium-helper"
+             :command (list (fermium--helper-program))
+             :connection-type 'pipe
+             :coding 'utf-8
+             :noquery t
+             :filter #'fermium--process-filter
+             :sentinel #'fermium--process-sentinel)))))
 
 (defun fermium--process-filter (process output)
   (when (eq process fermium--process)
@@ -687,7 +723,7 @@ older callers and for the empty-state UI tests; helper state uses
 (defun fermium--ensure-account-status-fields (account)
   "Ensure ACCOUNT has fields used to track connection status."
   (dolist (key '("connection_status" "last_sync_timestamp"
-                 "connection_error"))
+                 "connection_error" "initial_sync_failed"))
     (unless (assoc key account)
       (setq account (cons (cons key nil) account))))
   account)
@@ -719,6 +755,10 @@ older callers and for the empty-state UI tests; helper state uses
         (timestamp (fermium--format-sync-timestamp
                     (fermium--event-value account "last_sync_timestamp"))))
     (cond
+     ((fermium--event-value account "initial_sync_failed")
+      (format "%s: initial sync failed%s"
+              account-id
+              (if error (format ": %s" error) "")))
      (error (format "%s: %s" account-id error))
      ((equal status "offline")
       (format "%s: offline" account-id))
@@ -1194,6 +1234,11 @@ buffers can still be created while a room's name is being resolved."
       (when (or (assoc "error" event) (equal status "online"))
         (setf (alist-get "connection_error" account nil nil #'string=)
               (unless (equal status "online") connection-error)))
+      (when (or (assoc "initial_sync_failed" event)
+                (equal status "online"))
+        (setf (alist-get "initial_sync_failed" account nil nil #'string=)
+              (and (not (equal status "online"))
+                   (fermium--event-value event "initial_sync_failed"))))
       (when (member status '("online" "offline"))
         (setf (alist-get "rooms_loading" account nil nil #'string=) nil)))
     (fermium--force-mode-line-update account-id)
@@ -1563,17 +1608,22 @@ buffers can still be created while a room's name is being resolved."
     (fermium--overview-help)))
 
 (defun fermium--overview-insert-rooms-section
-    (account-id &optional rooms rooms-loading)
+    (account-id &optional rooms rooms-loading initial-sync-failed)
   (let ((rooms (if account-id
                    (or rooms (fermium--rooms-for-account account-id))
                  (or rooms fermium--rooms))))
     (fermium--overview-insert-section
      'rooms
-     (if rooms-loading
-         "Rooms (loading)"
-       (format "Rooms (%d)" (length rooms)))
+     (cond
+      (initial-sync-failed "Rooms (initial sync failed)")
+      (rooms-loading "Rooms (loading)")
+      (t (format "Rooms (%d)" (length rooms))))
      (lambda ()
        (cond
+        (initial-sync-failed
+         (insert "Initial sync failed. Press g to retry.\n")
+         (dolist (room (fermium--overview-sorted-rooms rooms))
+           (fermium--overview-insert-room room account-id)))
         (rooms
          (dolist (room (fermium--overview-sorted-rooms rooms))
            (fermium--overview-insert-room room account-id)))
@@ -1610,7 +1660,8 @@ buffers can still be created while a room's name is being resolved."
                                  (fermium--loading-dots)))
                (fermium--overview-insert-rooms-section
                 account-id rooms
-                (fermium--event-value account "rooms_loading"))))
+                (fermium--event-value account "rooms_loading")
+                (fermium--event-value account "initial_sync_failed"))))
            ""
            (list 'account account-id nil)
            (list 'account account-id)))))
@@ -1645,6 +1696,9 @@ buffers can still be created while a room's name is being resolved."
                               (if (assoc "rooms_loading" event)
                                   (fermium--event-value event "rooms_loading")
                                 t))
+                        (cons "initial_sync_failed"
+                              (fermium--event-value event
+                                                    "initial_sync_failed"))
                         (cons "connection_status"
                               (fermium--event-value event
                                                     "connection_status"))
@@ -1670,7 +1724,8 @@ buffers can still be created while a room's name is being resolved."
     ;; snapshot is reloaded.  Keep the locally accepted read state until a
     ;; new message arrives.
     (setq fermium--accounts
-          (fermium--apply-local-read-state accounts))
+          (fermium--apply-local-read-state
+           (mapcar #'fermium--ensure-account-status-fields accounts)))
     (setq fermium--account nil)
     (setq fermium--rooms nil)
     (let ((account-ids (fermium--account-ids)))

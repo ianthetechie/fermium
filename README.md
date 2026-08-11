@@ -56,6 +56,14 @@ and fold/unfold sections with `TAB`.
 `RET` on a room opens a room buffer where you can view and compose messages.
 In a room, `C-c o` returns to the overview in the same window.
 
+### Sync timeouts
+
+`fermium-initial-sync-timeout` controls how long Fermium waits for the first
+Matrix sync and defaults to 300 seconds. `fermium-sync-long-poll-timeout`
+controls subsequent sync long-polls; it defaults to `nil`, which uses the
+Matrix SDK default. Both options are available through
+`M-x customize-group RET fermium` and are read when the helper process starts.
+
 ## Themes and face customization
 
 Fermium uses named faces that inherit from Emacs's standard theme-aware faces;

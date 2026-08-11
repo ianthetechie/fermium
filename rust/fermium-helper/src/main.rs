@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    env::{self, VarError},
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::Write,
@@ -22,7 +23,7 @@ use fermium_core::{
 use matrix_sdk::{
     Client, LoopCtrl, Room, RoomMemberships, RoomState,
     authentication::matrix::MatrixSession,
-    config::SyncSettings,
+    config::{RequestConfig, SyncSettings},
     deserialized_responses::TimelineEvent,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy},
     room::{MessagesOptions, Receipts},
@@ -51,6 +52,57 @@ type SharedSessions = Arc<Mutex<HashMap<String, Session>>>;
 type SharedPendingLogins = Arc<Mutex<HashMap<u64, PendingLogin>>>;
 type SharedRoomMemberContexts = Arc<Mutex<HashMap<String, RoomMemberContext>>>;
 
+const DEFAULT_INITIAL_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy)]
+struct SyncTimeouts {
+    initial: Duration,
+    long_poll: Option<Duration>,
+}
+
+impl Default for SyncTimeouts {
+    fn default() -> Self {
+        Self {
+            initial: DEFAULT_INITIAL_SYNC_TIMEOUT,
+            long_poll: None,
+        }
+    }
+}
+
+impl SyncTimeouts {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            initial: duration_from_environment("FERMIUM_INITIAL_SYNC_TIMEOUT")?
+                .unwrap_or(DEFAULT_INITIAL_SYNC_TIMEOUT),
+            long_poll: duration_from_environment("FERMIUM_SYNC_TIMEOUT")?,
+        })
+    }
+
+    fn request_config(self) -> RequestConfig {
+        RequestConfig::new().timeout(self.initial)
+    }
+
+    fn long_poll_settings(self) -> SyncSettings {
+        self.long_poll
+            .map_or_else(SyncSettings::default, |timeout| {
+                SyncSettings::new().timeout(timeout)
+            })
+    }
+}
+
+fn duration_from_environment(name: &str) -> Result<Option<Duration>> {
+    match env::var(name) {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map(Some)
+            .with_context(|| format!("{name} must contain a non-negative number of seconds")),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {name}")),
+    }
+}
+
 struct Session {
     client: Client,
     sync_task: Option<tokio::task::JoinHandle<()>>,
@@ -70,6 +122,7 @@ struct RoomMemberContext {
 #[derive(Clone, Default)]
 struct ConnectionState {
     status: Option<ConnectionStatus>,
+    initial_sync_failed: bool,
     last_sync_timestamp: Option<i64>,
     error: Option<String>,
 }
@@ -102,7 +155,9 @@ async fn main() -> Result<()> {
         .await
         .context("helper output closed before ready event")?;
 
-    restore_persisted_sessions(&sessions, &events_tx);
+    let sync_timeouts = SyncTimeouts::from_environment().context("reading sync timeouts")?;
+
+    restore_persisted_sessions(&sessions, &events_tx, sync_timeouts);
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -125,6 +180,7 @@ async fn main() -> Result<()> {
             Arc::clone(&sessions),
             Arc::clone(&pending_logins),
             events_tx.clone(),
+            sync_timeouts,
         )
         .await;
         if should_quit {
@@ -162,6 +218,7 @@ async fn handle_request(
     sessions: SharedSessions,
     pending_logins: SharedPendingLogins,
     events: EventSender,
+    sync_timeouts: SyncTimeouts,
 ) {
     let request_id = request.request_id();
     let result = match request {
@@ -179,6 +236,7 @@ async fn handle_request(
                 homeserver,
                 username,
                 password,
+                sync_timeouts,
             )
             .await
         }
@@ -193,6 +251,7 @@ async fn handle_request(
                 &events,
                 login_request_id,
                 recovery_key,
+                sync_timeouts,
             )
             .await
         }
@@ -250,6 +309,7 @@ async fn login(
     homeserver: String,
     username: String,
     password: String,
+    sync_timeouts: SyncTimeouts,
 ) -> Result<()> {
     let store_key = account_store_key(&homeserver, &username);
     if sessions
@@ -265,7 +325,7 @@ async fn login(
     {
         return Err(anyhow!("Matrix account is already logged in"));
     }
-    let client = build_client_with_store(&homeserver, &store_key).await?;
+    let client = build_client_with_store(&homeserver, &store_key, sync_timeouts).await?;
     client
         .matrix_auth()
         .login_username(&username, &password)
@@ -293,7 +353,14 @@ async fn login(
         Ok(())
     } else {
         activate_session(
-            sessions, events, request_id, client, homeserver, store_key, true,
+            sessions,
+            events,
+            request_id,
+            client,
+            homeserver,
+            store_key,
+            true,
+            sync_timeouts,
         )
         .await
     }
@@ -305,6 +372,7 @@ async fn login_recovery_key(
     events: &EventSender,
     login_request_id: u64,
     recovery_key: String,
+    sync_timeouts: SyncTimeouts,
 ) -> Result<()> {
     let pending = pending_logins
         .lock()
@@ -339,6 +407,7 @@ async fn login_recovery_key(
         homeserver,
         store_key,
         true,
+        sync_timeouts,
     )
     .await
 }
@@ -463,6 +532,7 @@ async fn list_state(
             homeserver,
             rooms: fast_room_summaries(&client),
             rooms_loading: !initial_sync_complete,
+            initial_sync_failed: connection_state.initial_sync_failed,
             connection_status: connection_state.status,
             last_sync_timestamp: connection_state.last_sync_timestamp,
             connection_error: connection_state.error,
@@ -847,7 +917,11 @@ async fn load_room_member_context(room: &Room, sync_members: bool) -> RoomMember
     context
 }
 
-async fn build_client_with_store(homeserver: &str, store_key: &str) -> Result<Client> {
+async fn build_client_with_store(
+    homeserver: &str,
+    store_key: &str,
+    sync_timeouts: SyncTimeouts,
+) -> Result<Client> {
     let homeserver_url = Url::parse(homeserver).context("homeserver must be a valid URL")?;
     let store_path = account_store_path(store_key)?;
     let parent = store_path
@@ -857,6 +931,7 @@ async fn build_client_with_store(homeserver: &str, store_key: &str) -> Result<Cl
     let client = Client::builder()
         .homeserver_url(homeserver_url)
         .sqlite_store(store_path, None)
+        .request_config(sync_timeouts.request_config())
         .build()
         .await
         .context("building Matrix client")?;
@@ -884,6 +959,7 @@ async fn activate_session(
     homeserver: String,
     store_key: String,
     persist: bool,
+    sync_timeouts: SyncTimeouts,
 ) -> Result<()> {
     let user_id = client
         .user_id()
@@ -1010,6 +1086,7 @@ async fn activate_session(
                     homeserver: homeserver.clone(),
                     rooms,
                     rooms_loading: true,
+                    initial_sync_failed: false,
                     connection_status: None,
                     last_sync_timestamp: None,
                     connection_error: None,
@@ -1025,6 +1102,7 @@ async fn activate_session(
                 homeserver,
                 rooms,
                 rooms_loading: true,
+                initial_sync_failed: false,
                 connection_status: None,
                 last_sync_timestamp: None,
                 connection_error: None,
@@ -1040,6 +1118,7 @@ async fn activate_session(
         initial_sync_complete,
         connection_state,
         room_member_contexts,
+        sync_timeouts,
     ));
     if let Some(session) = sessions.lock().await.get_mut(&account) {
         session.sync_task = Some(sync_task);
@@ -1085,13 +1164,17 @@ async fn sync_forever(
     initial_sync_complete: Arc<AtomicBool>,
     connection_state: Arc<Mutex<ConnectionState>>,
     room_member_contexts: SharedRoomMemberContexts,
+    sync_timeouts: SyncTimeouts,
 ) {
     // `Client::sync` returns on the first error.  Consume errors in the
     // callback instead so the SDK's sync stream can retry after a temporary
     // network outage, such as the connection loss caused by system sleep.
     send_fast_room_summaries(&client, &events, &account).await;
 
-    let initial_result = client.sync_once(SyncSettings::default()).await;
+    // Initial sync; the zero timeout disables long-polling.
+    let initial_result = client
+        .sync_once(SyncSettings::new().timeout(Duration::ZERO))
+        .await;
     let initial_ok = initial_result.is_ok();
     if let Err(error) = initial_result {
         let error = error.to_string();
@@ -1103,6 +1186,7 @@ async fn sync_forever(
             ConnectionStatus::Offline,
             None,
             Some(error),
+            true,
         )
         .await;
     } else {
@@ -1116,6 +1200,7 @@ async fn sync_forever(
             ConnectionStatus::Online,
             Some(current_timestamp_millis()),
             None,
+            false,
         )
         .await;
     }
@@ -1126,7 +1211,7 @@ async fn sync_forever(
     let callback_initial_sync_complete = Arc::clone(&initial_sync_complete);
     let callback_room_member_contexts = Arc::clone(&room_member_contexts);
     let result = client
-        .sync_with_result_callback(SyncSettings::default(), |result| {
+        .sync_with_result_callback(sync_timeouts.long_poll_settings(), |result| {
             let events = events.clone();
             let online = Arc::clone(&online);
             let account = callback_account.clone();
@@ -1154,6 +1239,7 @@ async fn sync_forever(
                             ConnectionStatus::Online,
                             Some(current_timestamp_millis()),
                             None,
+                            false,
                         )
                         .await;
                     }
@@ -1169,6 +1255,7 @@ async fn sync_forever(
                             ConnectionStatus::Offline,
                             None,
                             Some(error),
+                            !initial_sync_complete.load(Ordering::Acquire),
                         )
                         .await;
                     }
@@ -1189,6 +1276,7 @@ async fn sync_forever(
             ConnectionStatus::Offline,
             None,
             Some(error),
+            !initial_sync_complete.load(Ordering::Acquire),
         )
         .await;
     }
@@ -1201,10 +1289,12 @@ async fn fermium_set_connection_status(
     status: ConnectionStatus,
     last_sync_timestamp: Option<i64>,
     error: Option<String>,
+    initial_sync_failed: bool,
 ) {
     let last_sync_timestamp = {
         let mut state = connection_state.lock().await;
         state.status = Some(status.clone());
+        state.initial_sync_failed = initial_sync_failed;
         if let Some(timestamp) = last_sync_timestamp {
             state.last_sync_timestamp = Some(timestamp);
         }
@@ -1215,13 +1305,18 @@ async fn fermium_set_connection_status(
         .send(Event::ConnectionStatus {
             account: account.to_owned(),
             status,
+            initial_sync_failed,
             last_sync_timestamp,
             error,
         })
         .await;
 }
 
-fn restore_persisted_sessions(sessions: &SharedSessions, events: &EventSender) {
+fn restore_persisted_sessions(
+    sessions: &SharedSessions,
+    events: &EventSender,
+    sync_timeouts: SyncTimeouts,
+) {
     let stored_sessions = match load_persisted_sessions() {
         Ok(stored_sessions) => stored_sessions,
         Err(error) => {
@@ -1240,9 +1335,20 @@ fn restore_persisted_sessions(sessions: &SharedSessions, events: &EventSender) {
         let events = events.clone();
         tokio::spawn(async move {
             let result = async {
-                let client = build_client_with_store(&homeserver, &store_key).await?;
+                let client =
+                    build_client_with_store(&homeserver, &store_key, sync_timeouts).await?;
                 client.restore_session(stored.session).await?;
-                activate_session(&sessions, &events, 0, client, homeserver, store_key, false).await
+                activate_session(
+                    &sessions,
+                    &events,
+                    0,
+                    client,
+                    homeserver,
+                    store_key,
+                    false,
+                    sync_timeouts,
+                )
+                .await
             }
             .await;
             if let Err(error) = result {
@@ -1538,4 +1644,108 @@ async fn send_error(events: &EventSender, request_id: Option<u64>, code: &str, m
             message,
         })
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::{
+        SessionMeta, SessionTokens,
+        ruma::{owned_device_id, owned_user_id},
+    };
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    async fn delayed_sync_client(sync_timeouts: SyncTimeouts) -> (MockServer, Client) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "versions": ["v1.1"],
+                "unstable_features": {}
+            })))
+            .mount(&server)
+            .await;
+        let homeserver = server.uri();
+        let client = Client::builder()
+            .homeserver_url(&homeserver)
+            .request_config(sync_timeouts.request_config().disable_retry())
+            .build()
+            .await
+            .expect("test client should build");
+        client
+            .restore_session(MatrixSession {
+                meta: SessionMeta {
+                    user_id: owned_user_id!("@alice:example.org"),
+                    device_id: owned_device_id!("TESTDEVICE"),
+                },
+                tokens: SessionTokens {
+                    access_token: "test-token".to_owned(),
+                    refresh_token: None,
+                },
+            })
+            .await
+            .expect("test session should restore");
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/sync"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(json!({
+                        "device_one_time_keys_count": {},
+                        "next_batch": "s1",
+                        "device_lists": {"changed": [], "left": []},
+                        "rooms": {
+                            "invite": {},
+                            "join": {},
+                            "leave": {},
+                            "knock": {}
+                        },
+                        "to_device": {"events": []},
+                        "presence": {"events": []},
+                        "account_data": {"events": []}
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        (server, client)
+    }
+
+    #[test]
+    fn default_initial_sync_timeout_is_five_minutes() {
+        assert_eq!(SyncTimeouts::default().initial, Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn delayed_initial_sync_uses_the_configured_request_timeout() {
+        let short_timeouts = SyncTimeouts {
+            initial: Duration::from_millis(10),
+            long_poll: None,
+        };
+        let (_short_server, short_client) = delayed_sync_client(short_timeouts).await;
+        assert!(
+            short_client
+                .sync_once(SyncSettings::new().timeout(Duration::ZERO))
+                .await
+                .is_err(),
+            "a delayed response should fail with a shorter request timeout"
+        );
+
+        let long_timeouts = SyncTimeouts {
+            initial: Duration::from_millis(200),
+            long_poll: None,
+        };
+        let (_long_server, long_client) = delayed_sync_client(long_timeouts).await;
+        let result = long_client
+            .sync_once(SyncSettings::new().timeout(Duration::ZERO))
+            .await;
+        assert!(
+            result.is_ok(),
+            "the same delayed response should succeed with the configured timeout: {result:?}"
+        );
+    }
 }

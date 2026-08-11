@@ -36,6 +36,21 @@
       (when (timerp fermium--loading-timer)
         (cancel-timer fermium--loading-timer)))))
 
+(ert-deftest fermium-helper-environment-configures-sync-timeouts ()
+  (let ((process-environment '("PATH=/bin"))
+        (fermium-initial-sync-timeout 300)
+        (fermium-sync-long-poll-timeout nil))
+    (let ((environment (fermium--helper-environment)))
+      (should (member "FERMIUM_INITIAL_SYNC_TIMEOUT=300" environment))
+      (should-not (seq-some (lambda (entry)
+                              (string-prefix-p "FERMIUM_SYNC_TIMEOUT=" entry))
+                            environment)))
+    (let ((fermium-initial-sync-timeout 600)
+          (fermium-sync-long-poll-timeout 45))
+      (let ((environment (fermium--helper-environment)))
+        (should (member "FERMIUM_INITIAL_SYNC_TIMEOUT=600" environment))
+        (should (member "FERMIUM_SYNC_TIMEOUT=45" environment))))))
+
 (ert-deftest fermium-login-prompts-for-a-recovery-key-challenge ()
   (let (sent)
     (cl-letf (((symbol-function 'read-passwd)
@@ -149,6 +164,28 @@
       (should (string-match-p "^▾ Rooms (loading)$" (buffer-string)))
       (should (string-match-p "Loading rooms" (buffer-string)))
       (should-not (string-match-p "No rooms yet" (buffer-string))))))
+
+(ert-deftest fermium-overview-shows-initial-sync-failure-instead-of-no-rooms ()
+  (with-temp-buffer
+    (fermium-overview-mode)
+    (let ((fermium--accounts
+           (list (list (cons "user_id" "@alice:example.org")
+                       (cons "homeserver" "https://example.org")
+                       (cons "rooms" nil)
+                       (cons "rooms_loading" nil)
+                       (cons "initial_sync_failed" t)
+                       (cons "connection_status" "offline")
+                       (cons "connection_error" "request timed out"))))
+          (fermium--account nil)
+          (fermium--rooms nil))
+      (fermium--render-overview)
+      (should (string-match-p "Rooms (initial sync failed)" (buffer-string)))
+      (should (string-match-p "Initial sync failed" (buffer-string)))
+      (should-not (string-match-p "No rooms yet" (buffer-string)))
+      (should (string-match-p
+               "initial sync failed"
+               (fermium--account-status-description
+                (car fermium--accounts)))))))
 
 (ert-deftest fermium-room-updates-are-merged-into-the-account ()
   (let* ((existing-room

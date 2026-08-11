@@ -90,6 +90,7 @@ pub enum Event {
         homeserver: String,
         rooms: Vec<RoomSummary>,
         rooms_loading: bool,
+        initial_sync_failed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         connection_status: Option<ConnectionStatus>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +158,7 @@ pub enum Event {
     ConnectionStatus {
         account: String,
         status: ConnectionStatus,
+        initial_sync_failed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_sync_timestamp: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +177,7 @@ pub struct AccountSummary {
     pub homeserver: String,
     pub rooms: Vec<RoomSummary>,
     pub rooms_loading: bool,
+    pub initial_sync_failed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_status: Option<ConnectionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,13 +315,14 @@ mod tests {
         let event = Event::ConnectionStatus {
             account: "@alice:example.org".to_owned(),
             status: ConnectionStatus::Online,
+            initial_sync_failed: false,
             last_sync_timestamp: None,
             error: None,
         };
         let encoded = serde_json::to_string(&event).expect("event should encode");
         assert_eq!(
             encoded,
-            r#"{"type":"connection_status","account":"@alice:example.org","status":"online"}"#
+            r#"{"type":"connection_status","account":"@alice:example.org","status":"online","initial_sync_failed":false}"#
         );
     }
 
@@ -327,13 +331,14 @@ mod tests {
         let event = Event::ConnectionStatus {
             account: "@alice:example.org".to_owned(),
             status: ConnectionStatus::Offline,
+            initial_sync_failed: true,
             last_sync_timestamp: Some(1_000),
             error: Some("network timeout".to_owned()),
         };
         let encoded = serde_json::to_string(&event).expect("event should encode");
         assert_eq!(
             encoded,
-            r#"{"type":"connection_status","account":"@alice:example.org","status":"offline","last_sync_timestamp":1000,"error":"network timeout"}"#
+            r#"{"type":"connection_status","account":"@alice:example.org","status":"offline","initial_sync_failed":true,"last_sync_timestamp":1000,"error":"network timeout"}"#
         );
     }
 
@@ -365,6 +370,7 @@ mod tests {
             homeserver: "https://example.org".to_owned(),
             rooms: vec![room.clone()],
             rooms_loading: true,
+            initial_sync_failed: false,
             connection_status: None,
             last_sync_timestamp: None,
             connection_error: None,
