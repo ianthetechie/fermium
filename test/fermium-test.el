@@ -1635,6 +1635,72 @@
                     (line-beginning-position) (line-end-position)))))
       (kill-buffer buffer))))
 
+(ert-deftest fermium-room-update-preserves-history-scroll-position ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room history scroll test*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (mapcar
+              (lambda (number)
+                (list (cons "event_id" (format "$%d" number))
+                      (cons "sender" "@bob:example.org")
+                      (cons "body" (format "history message %d" number))
+                      (cons "timestamp" number)))
+              (number-sequence 1 40)))
+            (goto-char (point-min))
+            (search-forward "history message 10")
+            (beginning-of-line)
+            (set-window-start (selected-window) (point))
+            (redisplay)
+            (let ((scroll-start (window-start)))
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "event_id" "$latest")
+                                 (cons "sender" "@bob:example.org")
+                                 (cons "body" "history message latest")
+                                 (cons "timestamp" 41)))))
+              (should (= (window-start) scroll-start))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-update-pins-composition-scroll-to-bottom ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room composition scroll test*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (mapcar
+              (lambda (number)
+                (list (cons "event_id" (format "$%d" number))
+                      (cons "sender" "@bob:example.org")
+                      (cons "body" (format "history message %d" number))
+                      (cons "timestamp" number)))
+              (number-sequence 1 40)))
+            (set-window-start (selected-window) (point-min))
+            (redisplay)
+            (goto-char (point-max))
+            (fermium--handle-message-event
+             (list (cons "room_id" "!room:example.org")
+                   (cons "message"
+                         (list (cons "event_id" "$latest")
+                               (cons "sender" "@bob:example.org")
+                               (cons "body" "history message latest")
+                               (cons "timestamp" 41)))))
+            (should (= (point) (point-max)))
+            (should (> (window-start) (point-min))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest fermium-room-queues-messages-while-history-loads ()
   (let ((buffer (get-buffer-create "*Fermium: !loading:example.org*")))
     (unwind-protect

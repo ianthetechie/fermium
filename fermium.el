@@ -2242,9 +2242,48 @@ buffers can still be created while a room's name is being resolved."
     (force-mode-line-update t)
     (fermium--stop-loading-animation-if-idle)))
 
+(defun fermium-room--window-scroll-state ()
+  "Return the displayed windows' scroll state for the current room buffer."
+  (mapcar
+   (lambda (window)
+     (list window (window-start window) (window-point window)))
+   (get-buffer-window-list (current-buffer) nil t)))
+
+(defun fermium-room--restore-window-scroll-state (states)
+  "Restore the displayed room windows' scroll state from STATES."
+  (dolist (state states)
+    (let ((window (nth 0 state))
+          (start (nth 1 state))
+          (window-point (nth 2 state)))
+      (when (and (window-live-p window)
+                 (eq (window-buffer window) (current-buffer)))
+        ;; The selected window shares the buffer's point, which has already
+        ;; been restored to its message anchor below.  Other windows have
+        ;; their own window points and need those restored independently.
+        (unless (eq window (selected-window))
+          (when window-point
+            (set-window-point window (min window-point (point-max)))))
+        (set-window-start window (min start (point-max)))))))
+
+(defun fermium-room--pin-window-to-bottom (window)
+  "Pin WINDOW displaying the current room buffer to its last line."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    ;; Set the start explicitly instead of relying on redisplay to follow
+    ;; point.  Re-rendering the buffer can otherwise leave a room window at
+    ;; point-min even though point is at the end of the composition.
+    (save-excursion
+      (goto-char (point-max))
+      (vertical-motion
+       (- (max 0 (1- (window-body-height window)))) window)
+      (beginning-of-line)
+      (set-window-start window (point)))
+    (set-window-point window (point-max))))
+
 (defun fermium-room--render-history (&optional draft)
   "Render the current room history and preserve DRAFT in the composition."
-  (let* ((point-position (point))
+  (let* ((window-scroll-state (fermium-room--window-scroll-state))
+         (point-position (point))
          (point-in-composition
           (and fermium-room--input-start
                (>= point-position (marker-position fermium-room--input-start))))
@@ -2258,7 +2297,9 @@ buffers can still be created while a room's name is being resolved."
     (fermium-room--render-history-contents draft)
     (cond
      (point-in-composition
-      (goto-char (point-max)))
+      (goto-char (point-max))
+      (dolist (state window-scroll-state)
+        (fermium-room--pin-window-to-bottom (car state))))
      ((and point-message-key
            (fermium-room--goto-message-key point-message-key))
       (let ((message-end
@@ -2268,7 +2309,9 @@ buffers can still be created while a room's name is being resolved."
      (t
       ;; Keep a point in the header or an otherwise unanchored history area
       ;; from being moved to the end of a rebuilt room.
-      (goto-char (min point-position (point-max)))))))
+      (goto-char (min point-position (point-max)))))
+    (unless point-in-composition
+      (fermium-room--restore-window-scroll-state window-scroll-state))))
 
 (defun fermium-room--message-position (key)
   "Return the start of the rendered message identified by KEY."

@@ -109,9 +109,10 @@ surface RoomConversation {
         UserReturnsToOverview(viewer, room)
 
     @guarantee IncomingMessagesPreservePoint
-        -- New messages are appended without moving the user's point. When
-        -- the user is already at the bottom, the new messages are visible
-        -- automatically.
+        -- When the viewer is composing, new messages keep the conversation
+        -- pinned to the bottom. When the viewer is reading history, new
+        -- messages leave the current scroll position unchanged and may stay
+        -- off-screen.
 
     @guarantee ReenteringRoomPreservesConversation
         -- Returning to a room that is already open reuses its current
