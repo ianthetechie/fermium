@@ -960,7 +960,8 @@ buffers can still be created while a room's name is being resolved."
       (fermium--request-state))
     (let ((buffer (get-buffer-create fermium--overview-buffer)))
       (with-current-buffer buffer
-        (fermium-overview-mode)
+        (unless (derived-mode-p 'fermium-overview-mode)
+          (fermium-overview-mode))
         (fermium--render-overview))
       (switch-to-buffer buffer)
       buffer)))
@@ -1772,49 +1773,52 @@ buffers can still be created while a room's name is being resolved."
              (buffer (or (fermium--room-by-id room-id account-id)
                          (get-buffer-create
                           (fermium--room-buffer-name room-id account-id
-                                                     room-name)))))
+                                                     room-name))))
+             (room-buffer-already-live
+              (with-current-buffer buffer
+                (derived-mode-p 'fermium-room-mode))))
         (with-current-buffer buffer
-          ;; Do not re-run the major mode on a room buffer that is already
-          ;; live.  Apart from resetting all of its state, that would discard
-          ;; the resize-timer handle and image descriptors without cleaning
-          ;; them up first.
-          (let ((room-buffer-already-live
-                 (derived-mode-p 'fermium-room-mode)))
-            (unless room-buffer-already-live
-              (fermium-room-mode))
-            (when room-buffer-already-live
-              (fermium-room--cancel-image-resize-timer)
-              (fermium-room--flush-image-states)
-              (clrhash fermium-room--image-states)))
-          (setq fermium-room--room-id room-id)
-          (setq fermium-room--account-id account-id)
-          (setq fermium-room--read-message-key nil)
-          (setq fermium-room--loading t)
-          (setq fermium-room--pending-messages nil)
-          (fermium-room--render-loading-room room-name latest-message))
-        (fermium--start-loading-animation)
+          (if room-buffer-already-live
+              (progn
+                ;; Re-entering a live room activates its existing view.  Do
+                ;; not replace its history with another bounded snapshot.
+                (setq fermium-room--room-id room-id)
+                (setq fermium-room--account-id account-id)
+                (setq fermium-room--room-title room-name)
+                (fermium-room--rename-buffer room-name)
+                (fermium-room--update-header-title room-name))
+            (fermium-room-mode)
+            (setq fermium-room--room-id room-id)
+            (setq fermium-room--account-id account-id)
+            (setq fermium-room--read-message-key nil)
+            (setq fermium-room--loading t)
+            (setq fermium-room--pending-messages nil)
+            (fermium-room--render-loading-room room-name latest-message)))
         (switch-to-buffer buffer)
-        (condition-case error
-            (fermium--send
-             "open_room"
-             (list (cons "account" account-id)
-                   (cons "room_id" room-id))
-             (lambda (event)
-               (when (equal (fermium--event-value event "type")
-                            "error")
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer
-                     (fermium-room--finish-loading)))
-                 (fermium--stop-loading-animation-if-idle)
-                 (message "Fermium: could not open room: %s"
-                          (fermium--event-value event "message")))))
-          (error
-           (when (buffer-live-p buffer)
-             (with-current-buffer buffer
-               (fermium-room--finish-loading)))
-           (fermium--stop-loading-animation-if-idle)
-           (message "Fermium: could not open room: %s"
-                    (error-message-string error))))))))
+        (if room-buffer-already-live
+            (fermium-room--maybe-mark-latest-message-read)
+          (fermium--start-loading-animation)
+          (condition-case error
+              (fermium--send
+               "open_room"
+               (list (cons "account" account-id)
+                     (cons "room_id" room-id))
+               (lambda (event)
+                 (when (equal (fermium--event-value event "type")
+                              "error")
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (fermium-room--finish-loading)))
+                   (fermium--stop-loading-animation-if-idle)
+                   (message "Fermium: could not open room: %s"
+                            (fermium--event-value event "message")))))
+            (error
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (fermium-room--finish-loading)))
+             (fermium--stop-loading-animation-if-idle)
+             (message "Fermium: could not open room: %s"
+                      (error-message-string error)))))))))
 
 (defun fermium--handle-room-opened (event)
   (let* ((room (fermium--event-value event "room"))

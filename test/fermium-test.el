@@ -1011,18 +1011,15 @@
                 fermium-room-mode-map))
     (should (eq (key-binding (kbd "C-c o")) #'fermium-room-overview))))
 
-(ert-deftest fermium-open-room-cleans-up-an-existing-room-buffer ()
+(ert-deftest fermium-open-room-preserves-existing-room-image-state ()
   (let ((overview (generate-new-buffer " *Fermium existing room overview*"))
         (room (get-buffer-create "*Fermium: !room:example.org*"))
-        (flushed nil)
         image)
     (unwind-protect
         (progn
           (with-current-buffer room
             (fermium-room-mode)
-            (setq image (create-image
-                         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-                         'png t :scale 1))
+            (setq image (list :test-image))
             (puthash "$image"
                      (list :status 'ready
                            :data "image-data"
@@ -1039,12 +1036,135 @@
               (fermium--overview-goto-property
                'fermium-room-id "!room:example.org")
               (cl-letf (((symbol-function 'fermium--send)
-                         (lambda (&rest _args) nil))
-                        ((symbol-function 'image-flush)
-                         (lambda (flushed-image &optional _frame)
-                           (push flushed-image flushed))))
+                         (lambda (&rest _args) nil)))
                 (fermium-open-room))))
-          (should (memq image flushed)))
+          (with-current-buffer room
+            (should (eq (plist-get (gethash "$image" fermium-room--image-states)
+                                   :image)
+                        image))))
+      (when (buffer-live-p room)
+        (kill-buffer room))
+      (when (buffer-live-p overview)
+        (kill-buffer overview)))))
+
+(ert-deftest fermium-reentering-overview-preserves-folded-sections ()
+  (let ((source (generate-new-buffer " *Fermium overview reentry source*"))
+        overview
+        (fermium--accounts
+         (list (list (cons "user_id" "@alice:example.org")
+                     (cons "rooms"
+                           (list (list (cons "room_id" "!room:example.org")
+                                       (cons "name" "Example room")))))))
+        (fermium--account nil)
+        (fermium--rooms nil))
+    (unwind-protect
+        (progn
+          (switch-to-buffer source)
+          (cl-letf (((symbol-function 'fermium--ensure-process)
+                     (lambda () nil))
+                    ((symbol-function 'fermium--request-state)
+                     (lambda () nil)))
+            (fermium)
+            (setq overview (get-buffer fermium--overview-buffer))
+            (with-current-buffer overview
+              (goto-char (point-min))
+              (fermium-toggle-section)
+              (should (member '(account "@alice:example.org")
+                              fermium--overview-collapsed-sections)))
+            (switch-to-buffer source)
+            (fermium-room-overview)
+            (should (eq (current-buffer) overview))
+            (with-current-buffer overview
+              (should (member '(account "@alice:example.org")
+                              fermium--overview-collapsed-sections))
+              (should (invisible-p
+                       (save-excursion
+                         (fermium--overview-goto-property
+                          'fermium-room-id "!room:example.org")
+                         (point)))))
+            (switch-to-buffer source)
+            (fermium)
+            (with-current-buffer overview
+              (should (member '(account "@alice:example.org")
+                              fermium--overview-collapsed-sections)))))
+      (when (buffer-live-p overview)
+        (kill-buffer overview))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
+
+(ert-deftest fermium-reentering-room-preserves-existing-state ()
+  (let ((overview (generate-new-buffer " *Fermium room reentry overview*"))
+        (room (get-buffer-create
+               "*Fermium: Example room / @alice:example.org*"))
+        sent)
+    (unwind-protect
+        (progn
+          (with-current-buffer room
+            (fermium-room-mode)
+            (setq fermium-room--room-id "!room:example.org")
+            (setq fermium-room--account-id "@alice:example.org")
+            (let ((messages
+                   (append
+                    (list (list (cons "kind" "channel_event")
+                                (cons "event_id" "$join")
+                                (cons "body" "Alice joined")
+                                (cons "timestamp" 1000))
+                          (list (cons "kind" "channel_event")
+                                (cons "event_id" "$leave")
+                                (cons "body" "Bob left")
+                                (cons "timestamp" 2000)))
+                    (cl-loop for index from 3 to 20
+                             collect (list (cons "event_id"
+                                                 (format "$message-%d" index))
+                                           (cons "body"
+                                                 (format "message %d" index))
+                                           (cons "timestamp" (* index 1000)))))))
+              (fermium-room--render-room
+               (list (cons "room_id" fermium-room--room-id)
+                     (cons "name" "Example room"))
+               messages))
+            (goto-char (point-min))
+            (search-forward "Channel events")
+            (beginning-of-line)
+            (fermium-room-toggle-channel-events)
+            (goto-char fermium-room--input-start)
+            (insert "draft")
+            (should (= 20 (length fermium-room--history-messages))))
+          (with-current-buffer overview
+            (fermium-overview-mode)
+            (let ((fermium--accounts
+                   (list (list (cons "user_id" "@alice:example.org")
+                               (cons "rooms"
+                                     (list (list
+                                            (cons "room_id"
+                                                  "!room:example.org")
+                                            (cons "name" "Example room")))))))
+                  (fermium--account nil)
+                  (fermium--rooms nil))
+              (fermium--render-overview)
+              (fermium--overview-goto-property
+               'fermium-room-id "!room:example.org")
+              (cl-letf (((symbol-function 'fermium--send)
+                         (lambda (command &rest _args)
+                           (push command sent))))
+                (fermium-open-room)
+                (should (eq (current-buffer) room)))))
+          (should-not (member "open_room" sent))
+          (with-current-buffer room
+            (should-not fermium-room--loading)
+            (should (= 20 (length fermium-room--history-messages)))
+            (should (string-match-p "message 20" (buffer-string)))
+            (should (string-suffix-p
+                     "draft"
+                     (buffer-substring-no-properties
+                      fermium-room--input-start (point-max))))
+            (should (gethash "$join" fermium-room--expanded-channel-events))
+            (should-not
+             (invisible-p
+              (save-excursion
+                (goto-char (point-min))
+                (search-forward "Alice joined")
+                (point))))))
       (when (buffer-live-p room)
         (kill-buffer room))
       (when (buffer-live-p overview)

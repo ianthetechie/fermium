@@ -89,7 +89,8 @@ surface Overview {
     @guarantee RelaunchReusesClientSession
         -- Launching Fermium again while it is already running reuses the
         -- existing client session and overview rather than creating another
-        -- instance.
+        -- instance, preserving the overview's current navigation and folding
+        -- state.
 }
 
 surface RoomConversation {
@@ -111,6 +112,12 @@ surface RoomConversation {
         -- New messages are appended without moving the user's point. When
         -- the user is already at the bottom, the new messages are visible
         -- automatically.
+
+    @guarantee ReenteringRoomPreservesConversation
+        -- Returning to a room that is already open reuses its current
+        -- conversation view, including loaded history, composition, and
+        -- presentation state, rather than replacing it with a fresh
+        -- recent-history snapshot.
 
     @guarantee PendingInputIsPreservedOnFailure
         -- While a message is being sent, the input is locked. On an error or
