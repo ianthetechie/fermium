@@ -268,6 +268,7 @@ coloring, or replace it with a custom list of faces."
 (defvar-local fermium-room--header-image-cache-key nil)
 (defvar-local fermium-room--header-image-cache nil)
 (defvar-local fermium-room--read-message-key nil)
+(defvar-local fermium-room--last-point-in-composition nil)
 
 (defun fermium-room--disable-line-numbers ()
   "Keep line numbers disabled in the current room buffer."
@@ -363,6 +364,7 @@ coloring, or replace it with a custom list of faces."
   (setq-local fermium-room--sending nil)
   (setq-local fermium-room--send-error nil)
   (setq-local fermium-room--read-message-key nil)
+  (setq-local fermium-room--last-point-in-composition nil)
   (setq-local fermium-room--loading nil)
   (setq-local fermium-room--pending-messages nil)
   (setq-local fermium-room--seed-message nil)
@@ -397,6 +399,8 @@ coloring, or replace it with a custom list of faces."
             #'fermium-room--window-selection-changed nil t)
   (add-hook 'window-scroll-functions
             #'fermium-room--window-scrolled nil t)
+  (add-hook 'post-command-hook
+            #'fermium-room--remember-point-position nil t)
   (add-hook 'post-command-hook
             #'fermium-room--maybe-mark-latest-message-read nil t)
   (add-hook 'kill-buffer-hook
@@ -2269,16 +2273,16 @@ buffers can still be created while a room's name is being resolved."
   "Pin WINDOW displaying the current room buffer to its last line."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
-    ;; Set the start explicitly instead of relying on redisplay to follow
-    ;; point.  Re-rendering the buffer can otherwise leave a room window at
-    ;; point-min even though point is at the end of the composition.
-    (save-excursion
-      (goto-char (point-max))
-      (vertical-motion
-       (- (max 0 (1- (window-body-height window)))) window)
-      (beginning-of-line)
-      (set-window-start window (point)))
-    (set-window-point window (point-max))))
+    ;; `recenter' understands visual lines, wrapping, images, and the
+    ;; window's actual height.  Temporarily selecting WINDOW also makes this
+    ;; work for an inactive room window; setting a character-based start
+    ;; calculated with `vertical-motion' can otherwise be only approximate.
+    ;; Suppress selection hooks while doing that temporary selection: an
+    ;; inactive room must not be treated as newly selected or marked read.
+    (let ((window-selection-change-functions nil))
+      (with-selected-window window
+        (goto-char (point-max))
+        (recenter -1)))))
 
 (defun fermium-room--render-history (&optional draft)
   "Render the current room history and preserve DRAFT in the composition."
@@ -2294,6 +2298,11 @@ buffers can still be created while a room's name is being resolved."
           (and point-message-key
                (- point-position
                   (fermium-room--message-start-at-point)))))
+    ;; Keep the user's logical point zone independent of any window Emacs
+    ;; may later choose while restoring a tab.  In particular, the buffer's
+    ;; point can be overwritten by another selected window during tab
+    ;; restoration even though the room was last left in its composition.
+    (setq fermium-room--last-point-in-composition point-in-composition)
     (fermium-room--render-history-contents draft)
     (cond
      (point-in-composition
@@ -2376,6 +2385,7 @@ buffers can still be created while a room's name is being resolved."
   "Retry marking the latest message when WINDOW is selected or deselected."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
+    (fermium-room--remember-point-position)
     (fermium-room--maybe-mark-latest-message-read)))
 
 (defun fermium-room--window-scrolled (window _start)
@@ -2400,6 +2410,27 @@ buffers can still be created while a room's name is being resolved."
   (add-function :after after-focus-change-function
                 #'fermium--after-focus-change)
   (setq fermium--focus-change-hook-installed t))
+
+(defun fermium-room--remember-point-position ()
+  "Remember whether the room's latest logical point was in composition."
+  (when (derived-mode-p 'fermium-room-mode)
+    (setq fermium-room--last-point-in-composition
+          (and fermium-room--input-start
+               (>= (point) (marker-position fermium-room--input-start))))))
+
+(defun fermium-room--tab-post-select (&rest _tabs)
+  "Pin visible room windows after restoring an Emacs tab."
+  (dolist (window (window-list nil 'nomini))
+    (let ((buffer (window-buffer window)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (and (derived-mode-p 'fermium-room-mode)
+                     fermium-room--last-point-in-composition)
+            (fermium-room--pin-window-to-bottom window)))))))
+
+(with-eval-after-load 'tab-bar
+  (add-hook 'tab-bar-tab-post-select-functions
+            #'fermium-room--tab-post-select))
 
 (defun fermium-room--render-history-contents (draft)
   "Render room contents without changing the caller's point policy."

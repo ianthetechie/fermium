@@ -1701,6 +1701,148 @@
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(ert-deftest fermium-room-update-pins-an-inactive-composition-window ()
+  (save-window-excursion
+    (let ((room (get-buffer-create " *Fermium inactive composition scroll test*"))
+          (other (get-buffer-create " *Fermium inactive composition other*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer other)
+            (let ((room-window (split-window-right)))
+              (with-current-buffer room
+                (fermium-room-mode)
+                (setq fermium-room--room-id "!room:example.org")
+                (fermium-room--render-room
+                 (list (cons "room_id" "!room:example.org"))
+                 (mapcar
+                  (lambda (number)
+                    (list (cons "event_id" (format "$%d" number))
+                          (cons "sender" "@bob:example.org")
+                          (cons "body" (format "history message %d" number))
+                          (cons "timestamp" number)))
+                  (number-sequence 1 40)))
+                (goto-char (point-max)))
+              (set-window-buffer room-window room)
+              (set-window-start room-window (with-current-buffer room
+                                               (point-min)))
+              (set-window-point room-window (with-current-buffer room
+                                               (point-max)))
+              (redisplay)
+              (with-current-buffer room
+                (fermium--handle-message-event
+                 (list (cons "room_id" "!room:example.org")
+                       (cons "message"
+                             (list (cons "event_id" "$latest")
+                                   (cons "sender" "@bob:example.org")
+                                   (cons "body" "history message latest")
+                                   (cons "timestamp" 41)))))
+                (should (> (window-start room-window) (point-min))))))
+        (when (buffer-live-p room)
+          (kill-buffer room))
+        (when (buffer-live-p other)
+          (kill-buffer other))))))
+
+(ert-deftest fermium-room-update-pins-composition-after-tab-switch ()
+  (require 'tab-bar)
+  (save-window-excursion
+    (let ((room (get-buffer-create " *Fermium tab composition scroll test*"))
+          (other (get-buffer-create " *Fermium tab composition other*")))
+      (unwind-protect
+          (progn
+            (tab-bar-mode 1)
+            (switch-to-buffer room)
+            (fermium-room-mode)
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (mapcar
+              (lambda (number)
+                (list (cons "event_id" (format "$%d" number))
+                      (cons "sender" "@bob:example.org")
+                      (cons "body" (format "history message %d" number))
+                      (cons "timestamp" number)))
+              (number-sequence 1 40)))
+            (goto-char (point-max))
+            (set-window-start (selected-window) (point-min))
+            (redisplay)
+            (tab-bar-new-tab)
+            (switch-to-buffer other)
+            (with-current-buffer room
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "event_id" "$latest")
+                                 (cons "sender" "@bob:example.org")
+                                 (cons "body" "history message latest")
+                                 (cons "timestamp" 41))))))
+            (tab-bar-select-tab 1)
+            (redisplay)
+            (should (> (window-start) (point-min))))
+        (tab-bar-select-tab 1)
+        (when (fboundp 'tab-bar-mode)
+          (tab-bar-mode -1))
+        (when (buffer-live-p room)
+          (kill-buffer room))
+        (when (buffer-live-p other)
+          (kill-buffer other))))))
+
+(ert-deftest fermium-room-update-pins-unfocused-room-window-after-tab-switch ()
+  (require 'tab-bar)
+  (save-window-excursion
+    (let ((room (get-buffer-create " *Fermium unfocused tab room*"))
+          (other (get-buffer-create " *Fermium unfocused tab other*"))
+          (second-tab (get-buffer-create " *Fermium unfocused tab second*")))
+      (unwind-protect
+          (progn
+            (tab-bar-mode 1)
+            (switch-to-buffer other)
+            (let ((room-window (split-window-right)))
+              (with-current-buffer room
+                (fermium-room-mode)
+                (setq fermium-room--room-id "!room:example.org")
+                (fermium-room--render-room
+                 (list (cons "room_id" "!room:example.org"))
+                 (mapcar
+                  (lambda (number)
+                    (list (cons "event_id" (format "$%d" number))
+                          (cons "sender" "@bob:example.org")
+                          (cons "body" (format "history message %d" number))
+                          (cons "timestamp" number)))
+                  (number-sequence 1 40)))
+                (goto-char (point-max)))
+              (set-window-buffer room-window room)
+              (set-window-point room-window (with-current-buffer room
+                                               (point-max)))
+              (set-window-start room-window (with-current-buffer room
+                                               (point-min)))
+              ;; Keep the other window selected when saving the tab.
+              (select-window (get-buffer-window other)))
+            (tab-bar-new-tab)
+            (switch-to-buffer second-tab)
+            (with-current-buffer room
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "event_id" "$latest")
+                                 (cons "sender" "@bob:example.org")
+                                 (cons "body" "history message latest")
+                                 (cons "timestamp" 41))))))
+            (tab-bar-select-tab 1)
+            (redisplay)
+            (let ((room-window (get-buffer-window room nil)))
+              (should room-window)
+              (should-not (eq room-window (selected-window)))
+              (should (> (window-start room-window) (point-min)))))
+        (tab-bar-select-tab 1)
+        (when (fboundp 'tab-bar-mode)
+          (tab-bar-mode -1))
+        (when (buffer-live-p room)
+          (kill-buffer room))
+        (when (buffer-live-p other)
+          (kill-buffer other))
+        (when (buffer-live-p second-tab)
+          (kill-buffer second-tab))))))
+
 (ert-deftest fermium-room-queues-messages-while-history-loads ()
   (let ((buffer (get-buffer-create "*Fermium: !loading:example.org*")))
     (unwind-protect
