@@ -14,6 +14,7 @@
 (require 'auth-source)
 (require 'button)
 (require 'cl-lib)
+(require 'ewoc)
 (require 'json)
 (require 'image)
 (require 'svg nil t)
@@ -260,6 +261,14 @@ coloring, or replace it with a custom list of faces."
 
 (defvar-local fermium--overview-collapsed-sections nil)
 
+(defvar-local fermium-room--ewoc nil
+  "The `ewoc' rendering this room's history, or nil before it is rendered.
+
+A node's data is the list of messages it renders as one unit: a single
+ordinary message, or a run of consecutive channel events folded into one
+section.  The node list is this room's history -- there is no second copy
+of it to keep in step.")
+
 (defvar-local fermium-room--resizing-images nil)
 (defvar-local fermium-room--image-resize-timer nil)
 (defvar-local fermium-room--send-error nil)
@@ -267,6 +276,9 @@ coloring, or replace it with a custom list of faces."
 (defvar-local fermium-room--header-expanded nil)
 (defvar-local fermium-room--header-image-cache-key nil)
 (defvar-local fermium-room--header-image-cache nil)
+(defvar-local fermium-room--nodes nil
+  "Hash mapping a message key to the ewoc node that renders it.
+Every message of a folded run maps to the one node holding the run.")
 (defvar-local fermium-room--read-message-key nil)
 (defvar-local fermium-room--last-point-in-composition nil)
 
@@ -357,7 +369,7 @@ coloring, or replace it with a custom list of faces."
 (define-derived-mode fermium-room-mode text-mode "Fermium-Room"
   "Major mode for a Fermium room conversation."
   (setq-local indent-tabs-mode nil)
-  (setq-local fermium-room--history-end nil)
+  (setq-local fermium-room--ewoc nil)
   (setq-local fermium-room--input-start nil)
   (setq-local fermium-room--room-id nil)
   (setq-local fermium-room--account-id nil)
@@ -368,7 +380,6 @@ coloring, or replace it with a custom list of faces."
   (setq-local fermium-room--loading nil)
   (setq-local fermium-room--pending-messages nil)
   (setq-local fermium-room--seed-message nil)
-  (setq-local fermium-room--history-messages nil)
   (setq-local fermium-room--room-title nil)
   (setq-local fermium-room--header-expanded nil)
   (setq-local fermium-room--header-image-cache-key nil)
@@ -378,7 +389,7 @@ coloring, or replace it with a custom list of faces."
   (setq-local fermium-room--image-states (make-hash-table :test #'equal))
   (setq-local fermium-room--resizing-images nil)
   (setq-local fermium-room--image-resize-timer nil)
-  (setq-local fermium-room--message-ids (make-hash-table :test #'equal))
+  (setq-local fermium-room--nodes (make-hash-table :test #'equal))
   (setq-local fermium-room--composition-overlay nil)
   (setq-local buffer-invisibility-spec '(fermium))
   (setq-local header-line-format '((:eval (fermium-room--header-line))))
@@ -511,8 +522,7 @@ coloring, or replace it with a custom list of faces."
           (when (and (derived-mode-p 'fermium-room-mode)
                      fermium-room--loading)
             (fermium-room--render-loading-indicator))
-          (when (and (derived-mode-p 'fermium-room-mode)
-                     (fermium-room--image-loading-p))
+          (when (derived-mode-p 'fermium-room-mode)
             (fermium-room--render-loading-images)))))))
 
 (defun fermium--ensure-process ()
@@ -2166,9 +2176,9 @@ buffers can still be created while a room's name is being resolved."
              (overlay-buffer fermium-room--composition-overlay))
     (delete-overlay fermium-room--composition-overlay))
   (setq fermium-room--composition-overlay nil)
-  (setq fermium-room--history-end nil)
+  (setq fermium-room--ewoc nil)
   (setq fermium-room--input-start nil)
-  (setq fermium-room--message-ids (make-hash-table :test #'equal))
+  (setq fermium-room--nodes (make-hash-table :test #'equal))
   (let ((inhibit-read-only t))
     (erase-buffer))
   (force-mode-line-update t))
@@ -2213,11 +2223,9 @@ buffers can still be created while a room's name is being resolved."
   "Render TITLE and the known LATEST-MESSAGE while history loads."
   (setq fermium-room--room-title title)
   (fermium-room--rename-buffer title)
-  (setq fermium-room--history-messages
-        (and latest-message (list latest-message)))
   (let ((inhibit-read-only t))
     (fermium-room--render-header title)
-    (fermium-room--insert-message-groups fermium-room--history-messages)
+    (fermium-room--build-history (and latest-message (list latest-message)))
     (fermium-room--render-composition nil))
   (setq fermium-room--seed-message latest-message)
   (force-mode-line-update t))
@@ -2235,39 +2243,20 @@ buffers can still be created while a room's name is being resolved."
           (or (fermium--event-value room "name")
               (fermium--event-value room "room_id")))
     (fermium-room--rename-buffer fermium-room--room-title)
-    (setq fermium-room--history-messages
-          (fermium-room--merge-messages
-           (append messages
-                   (when seed-message (list seed-message))
-                   (nreverse pending-messages))))
     (setq fermium-room--seed-message nil)
     (setq fermium-room--pending-messages nil)
-    (fermium-room--render-history draft)
+    (fermium-room--render-history
+     (append messages
+             (when seed-message (list seed-message))
+             (nreverse pending-messages))
+     draft)
     (force-mode-line-update t)
     (fermium--stop-loading-animation-if-idle)))
 
-(defun fermium-room--window-scroll-state ()
-  "Return the displayed windows' scroll state for the current room buffer."
-  (mapcar
-   (lambda (window)
-     (list window (window-start window) (window-point window)))
-   (get-buffer-window-list (current-buffer) nil t)))
-
-(defun fermium-room--restore-window-scroll-state (states)
-  "Restore the displayed room windows' scroll state from STATES."
-  (dolist (state states)
-    (let ((window (nth 0 state))
-          (start (nth 1 state))
-          (window-point (nth 2 state)))
-      (when (and (window-live-p window)
-                 (eq (window-buffer window) (current-buffer)))
-        ;; The selected window shares the buffer's point, which has already
-        ;; been restored to its message anchor below.  Other windows have
-        ;; their own window points and need those restored independently.
-        (unless (eq window (selected-window))
-          (when window-point
-            (set-window-point window (min window-point (point-max)))))
-        (set-window-start window (min start (point-max)))))))
+(defun fermium-room--point-in-composition-p ()
+  "Return non-nil when point is inside the room's writable composition."
+  (and fermium-room--input-start
+       (>= (point) (marker-position fermium-room--input-start))))
 
 (defun fermium-room--pin-window-to-bottom (window)
   "Pin WINDOW displaying the current room buffer to its last line."
@@ -2284,57 +2273,376 @@ buffers can still be created while a room's name is being resolved."
         (goto-char (point-max))
         (recenter -1)))))
 
-(defun fermium-room--render-history (&optional draft)
-  "Render the current room history and preserve DRAFT in the composition."
-  (let* ((window-scroll-state (fermium-room--window-scroll-state))
-         (point-position (point))
-         (point-in-composition
-          (and fermium-room--input-start
-               (>= point-position (marker-position fermium-room--input-start))))
-         (point-message-key
-          (and (not point-in-composition)
-               (fermium-room--message-key-at-point)))
-         (point-message-offset
-          (and point-message-key
-               (- point-position
-                  (fermium-room--message-start-at-point)))))
-    ;; Keep the user's logical point zone independent of any window Emacs
-    ;; may later choose while restoring a tab.  In particular, the buffer's
-    ;; point can be overwritten by another selected window during tab
-    ;; restoration even though the room was last left in its composition.
-    (setq fermium-room--last-point-in-composition point-in-composition)
-    (fermium-room--render-history-contents draft)
-    (cond
-     (point-in-composition
-      (goto-char (point-max))
-      (dolist (state window-scroll-state)
-        (fermium-room--pin-window-to-bottom (car state))))
-     ((and point-message-key
-           (fermium-room--goto-message-key point-message-key))
-      (let ((message-end
-             (next-single-property-change
-              (point) 'fermium-room-message-key nil (point-max))))
-        (goto-char (min (+ (point) point-message-offset) message-end))))
-     (t
-      ;; Keep a point in the header or an otherwise unanchored history area
-      ;; from being moved to the end of a rebuilt room.
-      (goto-char (min point-position (point-max)))))
-    (unless point-in-composition
-      (fermium-room--restore-window-scroll-state window-scroll-state))))
+(defun fermium-room--repin-composition-windows ()
+  "Pin every window showing this room back to the composition tail.
+Unlike a full re-render, a bounded history edit leaves the composition and
+the user's point inside it intact, so point is restored afterwards."
+  (save-excursion
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (fermium-room--pin-window-to-bottom window))))
+
+(defun fermium-room--render-history (messages &optional draft)
+  "Render MESSAGES as this room's history, preserving DRAFT in the composition."
+  (fermium-room--edit-history
+   (lambda ()
+     (fermium-room--render-header fermium-room--room-title)
+     (fermium-room--build-history messages)
+     (fermium-room--render-composition draft))))
+
+;;; What `ewoc.el' does not expose, kept here rather than spread about.
+
+(defun fermium-ewoc--end (ewoc)
+  "Return the end of EWOC's content."
+  (marker-position (ewoc-location (ewoc--footer ewoc))))
+
+(defun fermium-ewoc--delete (ewoc node)
+  "Delete NODE from EWOC, whose text may be read-only.
+Alone among the ewoc mutators, `ewoc-delete' does not allow for that."
+  (let ((inhibit-read-only t))
+    (ewoc-delete ewoc node)))
+
+;;; The history ewoc.  The composition sits below its footer, and so
+;;; outside it, which is what keeps a node change away from the input.
+
+(defun fermium-room--group-messages (messages)
+  "Split MESSAGES into the units the history renders, in order.
+Consecutive channel events fold into a single section, so they render as
+one unit; every other message renders on its own."
+  (let ((groups nil)
+        (run nil))
+    (dolist (message messages)
+      (if (fermium-room--channel-event-p message)
+          (push message run)
+        (when run
+          (push (nreverse run) groups)
+          (setq run nil))
+        (push (list message) groups)))
+    (when run (push (nreverse run) groups))
+    (nreverse groups)))
+
+(defun fermium-room--insert-group (messages)
+  "Insert MESSAGES as one rendered unit of the history.
+This is the history ewoc's pretty-printer."
+  (if (fermium-room--channel-event-p (car messages))
+      (fermium-room--insert-channel-events messages)
+    (fermium-room--insert-message (car messages))))
+
+(defun fermium-room--build-history (messages)
+  "Create the history ewoc at point holding MESSAGES."
+  (setq fermium-room--nodes (make-hash-table :test #'equal))
+  ;; No separator: the pretty-printer emits its own newlines.
+  (setq fermium-room--ewoc
+        (ewoc-create #'fermium-room--insert-group nil nil t))
+  (dolist (group (fermium-room--group-messages
+                  (fermium-room--merge-messages messages)))
+    (fermium-room--enter-group nil group))
+  (goto-char (point-max)))
+
+(defun fermium-room--history-end ()
+  "Return the end of the rendered history."
+  (if fermium-room--ewoc
+      (fermium-ewoc--end fermium-room--ewoc)
+    (point-max)))
+
+(defun fermium-room--history-messages ()
+  "Return the messages in this room's history, in order."
+  (when fermium-room--ewoc
+    (mapcan #'copy-sequence
+            (ewoc-collect fermium-room--ewoc #'identity))))
+
+(defun fermium-room--latest-message ()
+  "Return the last message in this room's history."
+  (when-let ((node (and fermium-room--ewoc
+                        (ewoc-nth fermium-room--ewoc -1))))
+    (car (last (ewoc-data node)))))
+
+(defun fermium-room--node-channel-p (node)
+  "Return non-nil when NODE renders a folded run of channel events."
+  (fermium-room--channel-event-p (car (ewoc-data node))))
+
+(defun fermium-room--node-first-time (node)
+  "Return the time of the first message NODE renders."
+  (fermium-room--message-timestamp (car (ewoc-data node))))
+
+(defun fermium-room--node-last-time (node)
+  "Return the time of the last message NODE renders."
+  (fermium-room--message-timestamp (car (last (ewoc-data node)))))
+
+(defun fermium-room--node-end (node)
+  "Return the end of NODE's rendered text."
+  (if-let ((next (ewoc-next fermium-room--ewoc node)))
+      (marker-position (ewoc-location next))
+    (fermium-room--history-end)))
+
+(defun fermium-room--node-for-key (key)
+  "Return the node rendering the message KEY, if it is shown."
+  (and fermium-room--nodes (gethash key fermium-room--nodes)))
+
+(defun fermium-room--node-message (node key)
+  "Return the message KEY names among those NODE renders."
+  (seq-find (lambda (message)
+              (equal key (fermium-room--message-key message)))
+            (ewoc-data node)))
+
+;; The three below are the only writers of `fermium-room--nodes', so the
+;; index cannot drift from what is on screen.
+
+(defun fermium-room--enter-group (before messages)
+  "Render MESSAGES as a new node before BEFORE, or last when BEFORE is nil."
+  (let ((node (if before
+                  (ewoc-enter-before fermium-room--ewoc before messages)
+                (ewoc-enter-last fermium-room--ewoc messages))))
+    (dolist (message messages)
+      (puthash (fermium-room--message-key message) node fermium-room--nodes))
+    node))
+
+(defun fermium-room--delete-node (node)
+  "Take NODE out of the history."
+  (dolist (message (ewoc-data node))
+    (remhash (fermium-room--message-key message) fermium-room--nodes))
+  (fermium-ewoc--delete fermium-room--ewoc node))
+
+(defun fermium-room--set-node-messages (node messages)
+  "Make NODE render MESSAGES instead of what it renders now."
+  (dolist (message (ewoc-data node))
+    (remhash (fermium-room--message-key message) fermium-room--nodes))
+  (setf (ewoc-data node) messages)
+  (dolist (message messages)
+    (puthash (fermium-room--message-key message) node fermium-room--nodes))
+  (ewoc-invalidate fermium-room--ewoc node))
+
+(defun fermium-room--message-region (key)
+  "Return the rendered region of the message KEY as a cons of start and end.
+Return nil when KEY is not rendered.  A folded section holds several events
+under one node, so the search runs inside that node alone."
+  (when-let ((node (fermium-room--node-for-key key)))
+    (let ((limit (fermium-room--node-end node))
+          (position (marker-position (ewoc-location node))))
+      (while (and (< position limit)
+                  (not (equal key (get-text-property
+                                   position 'fermium-room-message-key))))
+        (setq position (next-single-property-change
+                        position 'fermium-room-message-key nil limit)))
+      (when (< position limit)
+        (cons position
+              (next-single-property-change
+               position 'fermium-room-message-key nil limit))))))
 
 (defun fermium-room--message-position (key)
   "Return the start of the rendered message identified by KEY."
+  (car (fermium-room--message-region key)))
+
+(defun fermium-room--point-anchor ()
+  "Return what point is reading in the history, or nil when it reads nothing.
+The value is the key of what point is on, the offset into that key's text,
+and whether the key names a folded section rather than a message.  Text
+rewritten under point can end up a different length, or a different message
+altogether, so a reader's place is held by what they are reading."
+  (if-let* ((key (fermium-room--message-key-at-point))
+            (region (fermium-room--message-region key)))
+      (list key (- (point) (car region)) nil)
+    ;; A section's heading carries no message key.  The section is named by
+    ;; its first event, and that key does name the node.
+    (when-let* ((id (fermium-room--channel-events-id-at-point))
+                (node (fermium-room--node-for-key id)))
+      (list id (- (point) (marker-position (ewoc-location node))) t))))
+
+(defun fermium-room--anchor-at (position)
+  "Return an anchor for what POSITION reads in the history.
+Somewhere that reads nothing -- the header, a separator -- anchors on the
+position itself, which is the best a rebuilt room can offer it."
   (save-excursion
-    (when (fermium-room--goto-message-key key)
-      (point))))
+    (goto-char position)
+    (or (fermium-room--point-anchor) position)))
+
+(defun fermium-room--anchor-position (anchor)
+  "Return where ANCHOR reads now, or nil when its text is no longer shown."
+  (if (numberp anchor)
+      (min anchor (point-max))
+    (let* ((key (nth 0 anchor))
+           (node (fermium-room--node-for-key key))
+           (region (cond
+                    ((null node) nil)
+                    ((nth 2 anchor)
+                     (cons (marker-position (ewoc-location node))
+                           (fermium-room--node-end node)))
+                    (t (fermium-room--message-region key)))))
+      (when region
+        (min (+ (car region) (nth 1 anchor)) (cdr region))))))
+
+(defun fermium-room--goto-anchor (anchor)
+  "Put point back where ANCHOR was reading, when that text is still shown."
+  (when-let ((position (fermium-room--anchor-position anchor)))
+    (goto-char position)
+    t))
+
+(defun fermium-room--window-anchors ()
+  "Return anchors for the scroll and point of each window showing this room.
+The selected window shares the buffer's point, which is anchored on its
+own, so only the other windows need their point remembered."
+  (mapcar (lambda (window)
+            (list window
+                  (fermium-room--anchor-at (window-start window))
+                  (unless (eq window (selected-window))
+                    (fermium-room--anchor-at (window-point window)))))
+          (get-buffer-window-list (current-buffer) nil t)))
+
+(defun fermium-room--restore-window-anchors (anchors)
+  "Put each window back on the text its ANCHORS name."
+  (pcase-dolist (`(,window ,start ,held-point) anchors)
+    (when (and (window-live-p window)
+               (eq (window-buffer window) (current-buffer)))
+      (when-let* ((position (and held-point
+                                 (fermium-room--anchor-position held-point))))
+        (unless (= position (window-point window))
+          (set-window-point window position)))
+      (when-let ((position (fermium-room--anchor-position start)))
+        (unless (= position (window-start window))
+          (set-window-start window position))))))
+
+(defun fermium-room--edit-history (edit)
+  "Call EDIT, which changes the rendered history, and keep the room usable.
+
+Emacs carries markers, point and window starts along with the text after a
+bounded edit, but collapses whatever sat inside the text it replaced.  So a
+reader is held by what they are reading rather than by a position, whether
+that reader is point or a window."
+  (let* ((in-composition (fermium-room--point-in-composition-p))
+         (anchor (unless in-composition (fermium-room--anchor-at (point))))
+         (windows (unless in-composition (fermium-room--window-anchors)))
+         (inhibit-read-only t)
+         ;; The composition overlay is re-established by whoever renders the
+         ;; composition; a history edit never reaches it.
+         (inhibit-modification-hooks t)
+         ;; Rendering installs image display properties.  Those are derived
+         ;; UI state, not edits the user should have to undo.
+         (buffer-undo-list t))
+    ;; Keep the user's logical point zone independent of any window Emacs may
+    ;; later choose while restoring a tab, exactly as a full render does.
+    (setq fermium-room--last-point-in-composition in-composition)
+    (prog1 (funcall edit)
+      (fermium-room--protect-first-character)
+      (when anchor (fermium-room--goto-anchor anchor))
+      (if in-composition
+          ;; Growing the history above a composition would otherwise push it
+          ;; off the bottom of the window.
+          (fermium-room--repin-composition-windows)
+        (fermium-room--restore-window-anchors windows)))))
+
+(defun fermium-room--node-ends-after-p (node timestamp)
+  "Return non-nil when NODE renders a message later than TIMESTAMP."
+  (> (fermium-room--node-last-time node) timestamp))
+
+(defun fermium-room--placement-node (timestamp)
+  "Return the first node of the history that ends after TIMESTAMP.
+Return nil when every node ends at or before it.
+
+The search starts from whichever end TIMESTAMP lies nearer: messages arrive
+at the newest end and history pages in at the oldest, so neither may cost a
+walk over everything in between."
+  (let ((first (ewoc-nth fermium-room--ewoc 0))
+        (last (ewoc-nth fermium-room--ewoc -1)))
+    (when first
+      (if (< (- timestamp (fermium-room--node-first-time first))
+             (- (fermium-room--node-last-time last) timestamp))
+          (let ((node first))
+            (while (and node
+                        (not (fermium-room--node-ends-after-p node timestamp)))
+              (setq node (ewoc-next fermium-room--ewoc node)))
+            node)
+        (let ((node last)
+              (found nil))
+          (while (and node (fermium-room--node-ends-after-p node timestamp))
+            (setq found node)
+            (setq node (ewoc-prev fermium-room--ewoc node)))
+          found)))))
+
+(defun fermium-room--placement (timestamp)
+  "Return where a message timed TIMESTAMP belongs, as a node and an index.
+The index is how many of that node's messages precede it; a nil node means
+after the whole history.  Messages sharing a timestamp keep arrival order,
+newest last.  This is the one place the order of the history is decided."
+  (let ((node (fermium-room--placement-node timestamp)))
+    (cons node
+          (if (or (null node)
+                  (> (fermium-room--node-first-time node) timestamp))
+              0
+            ;; The message lands inside a folded run, which it splits in two.
+            (seq-count
+             (lambda (message)
+               (<= (fermium-room--message-timestamp message) timestamp))
+             (ewoc-data node))))))
+
+(defun fermium-room--regroups-p (message node index previous)
+  "Return non-nil when MESSAGE changes the grouping of the nodes around it.
+NODE and INDEX are its placement and PREVIOUS is the node before NODE.  A
+channel event joins whichever run it lands against; an ordinary message
+disturbs a run only by landing inside it, which splits it in two."
+  (if (fermium-room--channel-event-p message)
+      (or (and previous (fermium-room--node-channel-p previous))
+          (and node (fermium-room--node-channel-p node)))
+    (> index 0)))
+
+(defun fermium-room--place-message (message)
+  "Render MESSAGE in this room's history, in order."
+  (let* ((placement (fermium-room--placement
+                     (fermium-room--message-timestamp message)))
+         (node (car placement))
+         (index (cdr placement))
+         (previous (if node
+                       (ewoc-prev fermium-room--ewoc node)
+                     (ewoc-nth fermium-room--ewoc -1))))
+    (if (not (fermium-room--regroups-p message node index previous))
+        (fermium-room--enter-group node (list message))
+      ;; Rather than decide whether MESSAGE joins a run or splits one, splice
+      ;; it into the nodes it touches and group those again as a render from
+      ;; scratch would.
+      (let* ((join-previous (and previous
+                                 (= index 0)
+                                 (fermium-room--node-channel-p previous)))
+             (data (and node (ewoc-data node)))
+             (messages (append (and join-previous (ewoc-data previous))
+                               (seq-take data index)
+                               (list message)
+                               (seq-drop data index)))
+             (after (and node (ewoc-next fermium-room--ewoc node))))
+        (when join-previous (fermium-room--delete-node previous))
+        (when node (fermium-room--delete-node node))
+        (dolist (group (fermium-room--group-messages messages))
+          (fermium-room--enter-group after group))))))
+
+(defun fermium-room--unplace-message (key)
+  "Take the message KEY out of the rendered history.
+That makes its neighbours adjacent, so channel-event runs either side of it
+become one section and are rendered again as one."
+  (when-let ((node (fermium-room--node-for-key key)))
+    (let ((rest (seq-remove
+                 (lambda (message)
+                   (equal key (fermium-room--message-key message)))
+                 (ewoc-data node))))
+      (if rest
+          ;; KEY was one of a folded run, which simply loses it.
+          (fermium-room--set-node-messages node rest)
+        (let ((previous (ewoc-prev fermium-room--ewoc node))
+              (next (ewoc-next fermium-room--ewoc node)))
+          (if (not (and previous next
+                        (fermium-room--node-channel-p previous)
+                        (fermium-room--node-channel-p next)))
+              (fermium-room--delete-node node)
+            (let ((messages (append (ewoc-data previous) (ewoc-data next)))
+                  (after (ewoc-next fermium-room--ewoc next)))
+              (fermium-room--delete-node previous)
+              (fermium-room--delete-node node)
+              (fermium-room--delete-node next)
+              (dolist (group (fermium-room--group-messages messages))
+                (fermium-room--enter-group after group)))))))
+    t))
 
 (defun fermium-room--message-visible-in-window-p (key window)
   "Return non-nil when the end of message KEY is visible in WINDOW."
-  (when-let ((start (fermium-room--message-position key)))
-    (let ((end (next-single-property-change
-                start 'fermium-room-message-key nil (point-max))))
-      (and (<= (window-start window) start)
-           (<= (1- end) (window-end window t))))))
+  (when-let ((region (fermium-room--message-region key)))
+    (and (<= (window-start window) (car region))
+         (<= (1- (cdr region)) (window-end window t)))))
 
 (defun fermium-room--selected-focused-window ()
   "Return the selected, focused window when it displays this room buffer."
@@ -2356,7 +2664,7 @@ buffers can still be created while a room's name is being resolved."
              (not fermium-room--loading)
              fermium-room--account-id
              fermium-room--room-id)
-    (let* ((message (car (last fermium-room--history-messages)))
+    (let* ((message (fermium-room--latest-message))
            (event-id (and message
                           (fermium--event-value message "event_id")))
            (buffer (current-buffer)))
@@ -2415,8 +2723,7 @@ buffers can still be created while a room's name is being resolved."
   "Remember whether the room's latest logical point was in composition."
   (when (derived-mode-p 'fermium-room-mode)
     (setq fermium-room--last-point-in-composition
-          (and fermium-room--input-start
-               (>= (point) (marker-position fermium-room--input-start))))))
+          (fermium-room--point-in-composition-p))))
 
 (defun fermium-room--tab-post-select (&rest _tabs)
   "Pin visible room windows after restoring an Emacs tab."
@@ -2432,50 +2739,16 @@ buffers can still be created while a room's name is being resolved."
   (add-hook 'tab-bar-tab-post-select-functions
             #'fermium-room--tab-post-select))
 
-(defun fermium-room--render-history-contents (draft)
-  "Render room contents without changing the caller's point policy."
-  ;; Re-rendering installs image display properties.  Those are derived UI
-  ;; state, not edits the user should have to undo.
-  (let ((inhibit-read-only t)
-        (buffer-undo-list t))
-    (fermium-room--render-header fermium-room--room-title)
-    (fermium-room--insert-message-groups fermium-room--history-messages)
-    (fermium-room--render-composition draft)))
-
 (defun fermium-room--message-key-at-point ()
   "Return the message key at point, if point is in a rendered message."
   (or (get-text-property (point) 'fermium-room-message-key)
       (get-text-property (max (point-min) (1- (point)))
                          'fermium-room-message-key)))
 
-(defun fermium-room--message-start-at-point ()
-  "Return the start of the rendered message at point."
-  (let ((key (fermium-room--message-key-at-point)))
-    (when key
-      (save-excursion
-        (while (and (> (point) (point-min))
-                    (equal key
-                           (get-text-property
-                            (1- (point)) 'fermium-room-message-key)))
-          (backward-char 1))
-        (point)))))
-
-(defun fermium-room--goto-message-key (key)
-  "Move to the rendered message identified by KEY, if it exists."
-  (goto-char (point-min))
-  (let ((found nil))
-    (while (and (< (point) (point-max)) (not found))
-      (when (equal key (get-text-property (point) 'fermium-room-message-key))
-        (setq found t))
-      (unless found
-        (goto-char
-         (next-single-property-change
-          (point) 'fermium-room-message-key nil (point-max)))))
-    found))
-
 (defun fermium-room--render-composition (draft)
-  "Render the writable composition tail, preserving DRAFT when supplied."
-  (setq fermium-room--history-end (copy-marker (point)))
+  "Render the writable composition tail, preserving DRAFT when supplied.
+The composition is inserted after the history ewoc's footer, so it lies
+outside the ewoc and no node change can reach it."
   (fermium-room--insert-read-only "\n")
   (let ((start (point)))
     (fermium-room--insert-read-only
@@ -2493,15 +2766,19 @@ buffers can still be created while a room's name is being resolved."
   ;; matching message-sent event arrives.  Preserve the in-flight state on
   ;; the newly rendered composition in that interval.
   (fermium-room--set-input-read-only fermium-room--sending)
-  ;; A `read-only' text property does not protect insertion immediately before
-  ;; the first character carrying it.  Make the room's first history
-  ;; character front-sticky so point-min cannot be used to insert into the
-  ;; read-only area.
-  (when (< (point-min) (point-max))
-    (add-text-properties
-     (point-min) (1+ (point-min))
-     '(front-sticky (read-only keymap))))
+  (fermium-room--protect-first-character)
   (goto-char (point-max)))
+
+(defun fermium-room--protect-first-character ()
+  "Keep the room's first history character from accepting insertions.
+A `read-only' text property does not protect insertion immediately before
+the first character carrying it, so make that character front-sticky.  Any
+edit that can replace the first character has to reapply this."
+  (when (< (point-min) (point-max))
+    (let ((inhibit-read-only t))
+      (add-text-properties
+       (point-min) (1+ (point-min))
+       '(front-sticky (read-only keymap))))))
 
 (defun fermium-room--insert-read-only (text)
   "Insert TEXT into the room's read-only history zone."
@@ -2698,7 +2975,7 @@ on the inside edges of WINDOW."
              (not fermium-room--resizing-images))
     (let ((size (fermium-room--image-fit-size window)))
       (when size
-        (let ((changed nil)
+        (let ((changed-keys nil)
               (old-images nil))
           (maphash
            (lambda (key state)
@@ -2719,15 +2996,14 @@ on the inside edges of WINDOW."
                    (fermium-room--flush-image new-image)
                    (puthash key (plist-put state :image new-image)
                             fermium-room--image-states))
-                 (setq changed t))))
+                 (push key changed-keys))))
            fermium-room--image-states)
           (unwind-protect
-              (when changed
-                (let ((draft (and fermium-room--input-start
-                                  (buffer-substring-no-properties
-                                   fermium-room--input-start (point-max))))
-                      (fermium-room--resizing-images t))
-                  (fermium-room--render-history draft)))
+              (when changed-keys
+                ;; Only the messages carrying a refitted image need new
+                ;; display properties; the rest of the history is untouched.
+                (let ((fermium-room--resizing-images t))
+                  (fermium-room--refresh-messages changed-keys)))
             ;; The old descriptors are no longer installed after the render.
             ;; Flush them now instead of retaining their native backing data
             ;; for `image-cache-eviction-delay' seconds.
@@ -2803,37 +3079,19 @@ that a header click cannot fall through to PRIMARY-selection insertion."
   (fermium-room-display-image))
 
 (defun fermium-room--render-loading-images ()
-  "Update loading dots for images in the current room buffer."
-  (when (and (derived-mode-p 'fermium-room-mode)
-             (fermium-room--image-loading-p))
-    (let ((inhibit-read-only t))
-      (save-excursion
-        (goto-char (point-min))
-        (while (< (point) (point-max))
-          (let ((key (get-text-property (point) 'fermium-room-image-key)))
-            (if (and key
-                     (eq (plist-get (gethash key fermium-room--image-states)
-                                    :status)
-                         'loading))
-                (let* ((start (point))
-                       (end (next-single-property-change
-                             start 'fermium-room-image-key nil (point-max)))
-                       (properties (text-properties-at start)))
-                  (delete-region start end)
-                  (insert (fermium-room--image-loading-dots))
-                  (add-text-properties start (point) properties))
-              (goto-char
-               (next-single-property-change
-                (point) 'fermium-room-image-key nil (point-max))))))))))
+  "Restate the placeholders of images the room is still fetching."
+  (let ((keys nil))
+    (maphash (lambda (key state)
+               (when (eq (plist-get state :status) 'loading)
+                 (push key keys)))
+             fermium-room--image-states)
+    (fermium-room--refresh-messages keys)))
 
 (defun fermium-room--render-image-error (key message)
   (when-let ((state (gethash key fermium-room--image-states)))
     (fermium-room--flush-image (plist-get state :image)))
   (remhash key fermium-room--image-states)
-  (fermium-room--render-history
-   (and fermium-room--input-start
-        (buffer-substring-no-properties
-         fermium-room--input-start (point-max))))
+  (fermium-room--refresh-message key)
   (fermium--stop-loading-animation-if-idle)
   (message "Fermium: could not display image: %s" message))
 
@@ -2863,10 +3121,7 @@ that a header click cannot fall through to PRIMARY-selection insertion."
                                :type type
                                :image image)
                          fermium-room--image-states)
-                (fermium-room--render-history
-                 (and fermium-room--input-start
-                      (buffer-substring-no-properties
-                       fermium-room--input-start (point-max))))
+                (fermium-room--refresh-message key)
                 (fermium--stop-loading-animation-if-idle)))
           (error
            (fermium-room--render-image-error
@@ -2887,10 +3142,7 @@ that a header click cannot fall through to PRIMARY-selection insertion."
       (let ((buffer (current-buffer)))
         (puthash key (list :status 'loading)
                  fermium-room--image-states)
-        (fermium-room--render-history
-         (and fermium-room--input-start
-              (buffer-substring-no-properties
-               fermium-room--input-start (point-max))))
+        (fermium-room--refresh-message key)
         (fermium--start-loading-animation)
         (condition-case error
             (fermium--send
@@ -2946,22 +3198,6 @@ stable reference time."
   "Return non-nil when MESSAGE is a room state or membership event."
   (equal (fermium--event-value message "kind") "channel_event"))
 
-(defun fermium-room--insert-message-groups (messages)
-  "Insert MESSAGES, folding consecutive channel events into sections."
-  (let (channel-events)
-    (cl-labels
-        ((flush-channel-events ()
-           (when channel-events
-             (let ((events (nreverse channel-events)))
-               (fermium-room--insert-channel-events events))
-             (setq channel-events nil))))
-      (dolist (message messages)
-        (if (fermium-room--channel-event-p message)
-            (push message channel-events)
-          (flush-channel-events)
-          (fermium-room--insert-message message)))
-      (flush-channel-events))))
-
 (defun fermium-room--insert-channel-events (events)
   "Insert a collapsed section containing consecutive channel EVENTS."
   (let* ((first (car events))
@@ -3013,160 +3249,119 @@ stable reference time."
   "Collapse or expand the channel-event section at point."
   (interactive)
   (let ((group-id (fermium-room--channel-events-id-at-point)))
-    (if (not group-id)
+    (if (not (and group-id (fermium-room--node-for-key group-id)))
         (message "Fermium: no channel-event section at point")
-      (let ((expanded (gethash group-id
-                               fermium-room--expanded-channel-events))
-            header-start body-start body-end)
-        (save-excursion
-          (goto-char (point-min))
-          (while (and (< (point) (point-max))
-                      (not header-start))
-            (when (and (equal group-id
-                              (get-text-property
-                               (point) 'fermium-room-channel-events-id))
-                       (get-text-property
-                        (point) 'fermium-room-channel-events-header))
-              (setq header-start (point)))
-            (goto-char
-             (next-single-property-change
-              (point) 'fermium-room-channel-events-id nil (point-max))))
-          (when header-start
-            (goto-char header-start)
-            (setq body-start (line-beginning-position 2))
-            (when (equal group-id
-                         (get-text-property
-                          body-start 'fermium-room-channel-events-id))
-              (setq body-end
-                    (next-single-property-change
-                     body-start 'fermium-room-channel-events-id nil
-                     (point-max))))
-            (when body-end
-              (let ((inhibit-read-only t))
-                (goto-char header-start)
-                (delete-char 1)
-                (insert (if expanded "▸" "▾"))
-                (add-text-properties
-                 header-start (1+ header-start)
-                 `(read-only t
-                   keymap ,fermium-room--channel-events-map
-                   fermium-room-channel-events-id ,group-id
-                   fermium-room-channel-events-header t
-                   mouse-face highlight
-                   follow-link t
-                   help-echo "Click or TAB to expand channel events"))
-                (if expanded
-                    (add-text-properties body-start body-end
-                                         '(invisible fermium))
-                  (remove-text-properties body-start body-end
-                                          '(invisible)))))))
-        (puthash group-id (not expanded)
-                 fermium-room--expanded-channel-events)))))
-
-(defun fermium-room--message-seen-p (message)
-  (let ((key (fermium-room--message-key message)))
-    (if (gethash key fermium-room--message-ids)
-        t
-      (puthash key t fermium-room--message-ids)
-      nil)))
+      ;; Heading and body are one node, so the section restates itself from
+      ;; the flag alone.
+      (puthash group-id
+               (not (gethash group-id fermium-room--expanded-channel-events))
+               fermium-room--expanded-channel-events)
+      (fermium-room--refresh-message group-id))))
 
 (defun fermium-room--insert-message (message)
-  (unless (fermium-room--message-seen-p message)
-    (let* ((start (point))
-           (timestamp-start (point))
-           (sender-start nil)
-           (body-start nil)
-           (timestamp-value (fermium-room--message-timestamp message))
-           (timestamp nil)
-           (body-end nil)
-           (sender-id (fermium-room--message-sender-id message))
-           (sender-role (fermium-room--message-sender-role message))
-           (sender-label (fermium-room--message-sender-label message))
-           (sender-face (fermium-room--message-sender-face message))
-           (image (fermium--event-value message "image"))
-           (image-key (and image (fermium-room--message-key message)))
-           (image-source (and image
-                              (fermium--event-value image "source")))
-           (image-state (and image-key
-                             (gethash image-key fermium-room--image-states))))
-      (setq timestamp
-            (fermium-room--format-timestamp timestamp-value))
-      (insert timestamp)
-      (fermium-room--add-face-properties
-       timestamp-start (point) 'fermium-room-timestamp-face)
-      (if (fermium-room--channel-event-p message)
-          (insert " ")
+  (let* ((start (point))
+         (timestamp-start (point))
+         (sender-start nil)
+         (body-start nil)
+         (timestamp-value (fermium-room--message-timestamp message))
+         (timestamp nil)
+         (body-end nil)
+         (sender-id (fermium-room--message-sender-id message))
+         (sender-role (fermium-room--message-sender-role message))
+         (sender-label (fermium-room--message-sender-label message))
+         (sender-face (fermium-room--message-sender-face message))
+         (image (fermium--event-value message "image"))
+         (image-key (and image (fermium-room--message-key message)))
+         (image-source (and image
+                            (fermium--event-value image "source")))
+         (image-state (and image-key
+                           (gethash image-key fermium-room--image-states))))
+    (setq timestamp
+          (fermium-room--format-timestamp timestamp-value))
+    (insert timestamp)
+    (fermium-room--add-face-properties
+     timestamp-start (point) 'fermium-room-timestamp-face)
+    (if (fermium-room--channel-event-p message)
         (insert " ")
-        (setq sender-start (point))
-        (insert sender-label)
-        (fermium-room--add-face-properties sender-start (point) sender-face)
-        (add-text-properties
-         sender-start (point)
-         `(fermium-room-sender-id ,sender-id
-           fermium-room-sender-role ,sender-role))
-        (insert ":")
-        (unless image
-          (insert " ")))
-      (if image
-          (progn
-            (insert "\n")
-            (setq body-start (point))
-            (if (eq (plist-get image-state :status) 'ready)
-                ;; Keep the display image separate from its sender line and
-                ;; don't leave an alt-text placeholder or link styling behind.
-                (insert-image (plist-get image-state :image) " ")
-              (insert (if (eq (plist-get image-state :status) 'loading)
-                          (fermium-room--image-loading-dots)
-                        "[Image]"))))
-        (setq body-start (point))
-        (insert (or (fermium--event-value message "body") "")))
-      (setq body-end (point))
-      (insert "\n")
-      (fermium-room--add-face-properties body-start (point) 'default)
+      (insert " ")
+      (setq sender-start (point))
+      (insert sender-label)
+      (fermium-room--add-face-properties sender-start (point) sender-face)
       (add-text-properties
-       start (point)
-       `(read-only t
-         keymap ,fermium-room--read-only-map
-         fermium-room-message-key ,(fermium-room--message-key message)
-         fermium-room--message-timestamp ,timestamp-value))
-      (when (and image
-                 (not (eq (plist-get image-state :status) 'ready)))
-        (fermium-room--add-face-properties body-start body-end 'button)
-        (add-text-properties
-         body-start body-end
-         `(fermium-room-image t
-           fermium-room-image-key ,image-key
-           fermium-room-image-source ,image-source
-           mouse-face highlight
-           follow-link t
-           help-echo "RET or click to display image"
-           keymap ,fermium-room--image-map))))))
+       sender-start (point)
+       `(fermium-room-sender-id ,sender-id
+         fermium-room-sender-role ,sender-role))
+      (insert ":")
+      (unless image
+        (insert " ")))
+    (if image
+        (progn
+          (insert "\n")
+          (setq body-start (point))
+          (if (eq (plist-get image-state :status) 'ready)
+              ;; Keep the display image separate from its sender line and
+              ;; don't leave an alt-text placeholder or link styling behind.
+              (insert-image (plist-get image-state :image) " ")
+            (insert (if (eq (plist-get image-state :status) 'loading)
+                        (fermium-room--image-loading-dots)
+                      "[Image]"))))
+      (setq body-start (point))
+      (insert (or (fermium--event-value message "body") "")))
+    (setq body-end (point))
+    (insert "\n")
+    (fermium-room--add-face-properties body-start (point) 'default)
+    (add-text-properties
+     start (point)
+     `(read-only t
+       keymap ,fermium-room--read-only-map
+       fermium-room-message-key ,(fermium-room--message-key message)
+       fermium-room--message-timestamp ,timestamp-value))
+    (when (and image
+               (not (eq (plist-get image-state :status) 'ready)))
+      (fermium-room--add-face-properties body-start body-end 'button)
+      (add-text-properties
+       body-start body-end
+       `(fermium-room-image t
+         fermium-room-image-key ,image-key
+         fermium-room-image-source ,image-source
+         mouse-face highlight
+         follow-link t
+         help-echo "RET or click to display image"
+         keymap ,fermium-room--image-map)))))
 
-(defun fermium-room--message-insertion-point (message)
-  (let ((timestamp (fermium-room--message-timestamp message))
-        (limit (marker-position fermium-room--history-end))
-        (insertion-point nil))
-    (save-excursion
-      (goto-char (point-min))
-      (while (and (< (point) limit) (not insertion-point))
-        (let ((existing-timestamp
-               (get-text-property (point) 'fermium-room--message-timestamp)))
-          (when (and existing-timestamp (> existing-timestamp timestamp))
-            (setq insertion-point (point)))
-          (unless insertion-point
-            (goto-char
-             (next-single-property-change
-              (point) 'fermium-room--message-timestamp nil limit)))))
-      (or insertion-point limit))))
+(defun fermium-room--refresh-messages (keys)
+  "Re-render the messages KEYS where they are shown, in one edit."
+  (let ((nodes nil))
+    (dolist (key keys)
+      (when-let ((node (fermium-room--node-for-key key)))
+        (cl-pushnew node nodes)))
+    (when nodes
+      (fermium-room--edit-history
+       (lambda () (apply #'ewoc-invalidate fermium-room--ewoc nodes))))))
 
-(defun fermium-room--insert-live-message (message)
-  (when fermium-room--history-end
-    (save-excursion
-      (set-marker-insertion-type fermium-room--history-end t)
-      (goto-char (fermium-room--message-insertion-point message))
-      (let ((inhibit-read-only t))
-        (fermium-room--insert-message message))
-      (set-marker-insertion-type fermium-room--history-end nil))))
+(defun fermium-room--refresh-message (key)
+  "Re-render the message KEY where it is shown."
+  (fermium-room--refresh-messages (list key)))
+
+(defun fermium-room--add-live-message (message)
+  "Add MESSAGE to this room's history and show it.
+
+A message the client has sent is shown as soon as the homeserver accepts
+it, timed by the local clock, and arrives again through the next sync
+carrying `origin_server_ts'.  The homeserver's time is the room's, so the
+later report of an event supersedes the shown copy wherever the two
+disagree; where they agree there is nothing to redo."
+  (when fermium-room--ewoc
+    (let* ((key (fermium-room--message-key message))
+           (node (fermium-room--node-for-key key))
+           (superseded (and node (fermium-room--node-message node key))))
+      (unless (and superseded
+                   (= (fermium-room--message-timestamp superseded)
+                      (fermium-room--message-timestamp message)))
+        (fermium-room--edit-history
+         (lambda ()
+           (when superseded (fermium-room--unplace-message key))
+           (fermium-room--place-message message)))))))
 
 (defun fermium--room-by-id (room-id &optional account-id)
   (or (get-buffer (fermium--room-buffer-name room-id account-id))
@@ -3233,16 +3428,10 @@ stable reference time."
           (fermium--render-overview))))
     (when (and room-id message buffer (buffer-live-p buffer))
       (with-current-buffer buffer
-        (if (and fermium-room--history-end
+        (if (and fermium-room--ewoc
                  (not fermium-room--loading))
             (progn
-              (setq fermium-room--history-messages
-                    (fermium-room--merge-messages
-                     (cons message fermium-room--history-messages)))
-              (fermium-room--render-history
-               (and fermium-room--input-start
-                    (buffer-substring-no-properties
-                     fermium-room--input-start (point-max))))
+              (fermium-room--add-live-message message)
               (fermium-room--maybe-mark-latest-message-read))
           (push message fermium-room--pending-messages))))))
 
