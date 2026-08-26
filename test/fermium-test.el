@@ -3,6 +3,109 @@
 (require 'ert)
 (require 'fermium)
 
+(defun fermium-test--history-text ()
+  "Return the rendered history region of the current room buffer."
+  (buffer-substring-no-properties (point-min) (fermium-room--history-end)))
+
+(defun fermium-test--rerendered-history ()
+  "Return the text a render of the current history from scratch produces.
+Comparing an incrementally updated buffer against this checks that the two
+never disagree about what the history looks like, without assuming anything
+about how that order was arrived at."
+  (let ((messages (fermium-room--history-messages))
+        (expanded fermium-room--expanded-channel-events))
+    (with-temp-buffer
+      (fermium-room-mode)
+      (setq fermium-room--expanded-channel-events expanded)
+      (fermium-room--render-history messages)
+      (fermium-test--history-text))))
+
+(defun fermium-test--rendered-keys ()
+  "Return the message keys rendered in the current room buffer, in order."
+  (let ((keys nil)
+        (limit (fermium-room--history-end))
+        (position (point-min)))
+    (while (< position limit)
+      (let ((key (get-text-property position 'fermium-room-message-key)))
+        (when (and key (not (member key keys)))
+          (push key keys)))
+      (setq position (1+ position)))
+    (nreverse keys)))
+
+(defun fermium-test--window-start-line ()
+  "Return the line the selected window starts on."
+  (save-excursion
+    (goto-char (window-start))
+    (buffer-substring-no-properties (point) (line-end-position))))
+
+(defun fermium-test--image-message (index)
+  "Return a message carrying an image, named by INDEX."
+  (list (cons "event_id" (format "$img%d" index))
+        (cons "sender" "@bob:example.org")
+        (cons "body" "photo.png")
+        (cons "timestamp" (* (1+ index) 1000))
+        (cons "image"
+              (list (cons "source"
+                          (list (cons "url" "mxc://example.org/image")))))))
+
+(defun fermium-test--history-keys ()
+  "Return the message keys in the current room's history, in order."
+  (mapcar #'fermium-room--message-key (fermium-room--history-messages)))
+
+(defun fermium-test--spec-message (spec)
+  "Build a message from SPEC, a list of event id, timestamp and kind.
+The body is the event id, so a case can find its own messages in the text."
+  (let ((id (nth 0 spec))
+        (timestamp (nth 1 spec))
+        (kind (nth 2 spec)))
+    (append (when (eq kind 'channel)
+              (list (cons "kind" "channel_event")))
+            (list (cons "event_id" id)
+                  (cons "sender" "@bob:example.org")
+                  (cons "body" id)
+                  (cons "timestamp" timestamp)))))
+
+(defun fermium-test--seed-room (specs)
+  "Render a room in the current buffer holding the messages named by SPECS."
+  (fermium-room-mode)
+  (setq fermium-room--room-id "!room:example.org")
+  (fermium-room--render-room
+   (list (cons "room_id" "!room:example.org"))
+   (mapcar #'fermium-test--spec-message specs)))
+
+(defun fermium-test--rendered-units (thunk)
+  "Call THUNK and return how many history units the room rendered as it ran.
+A unit is one node of the history: a message, or a run of channel events
+folded into a section.  A room updated in place renders only the units the
+change touches, where one rebuilding itself renders every unit it holds."
+  (let ((rendered 0))
+    (cl-letf* ((printer (symbol-function 'fermium-room--insert-group))
+               ((symbol-function 'fermium-room--insert-group)
+                (lambda (messages)
+                  (setq rendered (1+ rendered))
+                  (funcall printer messages))))
+      (funcall thunk))
+    rendered))
+
+(defun fermium-test--deliver (specs)
+  "Deliver the messages named by SPECS to the current room, one at a time.
+Return how many history units the room rendered while doing it."
+  (fermium-test--rendered-units
+   (lambda ()
+     (dolist (spec specs)
+       (fermium--handle-message-event
+        (list (cons "room_id" "!room:example.org")
+              (cons "message" (fermium-test--spec-message spec))))))))
+
+(defun fermium-test--full-render (messages)
+  "Return the history text a render of MESSAGES from scratch produces.
+Incremental updates are correct exactly when they agree with this."
+  (with-temp-buffer
+    (fermium-room-mode)
+    (fermium-room--render-room
+     (list (cons "room_id" "!room:example.org")) messages)
+    (fermium-test--history-text)))
+
 (ert-deftest fermium-process-filter-identifies-a-failing-event ()
   (let ((fermium--process nil)
         (fermium--process-output "")
@@ -1129,7 +1232,7 @@
             (fermium-room-toggle-channel-events)
             (goto-char fermium-room--input-start)
             (insert "draft")
-            (should (= 20 (length fermium-room--history-messages))))
+            (should (= 20 (length (fermium-room--history-messages)))))
           (with-current-buffer overview
             (fermium-overview-mode)
             (let ((fermium--accounts
@@ -1152,7 +1255,7 @@
           (should-not (member "open_room" sent))
           (with-current-buffer room
             (should-not fermium-room--loading)
-            (should (= 20 (length fermium-room--history-messages)))
+            (should (= 20 (length (fermium-room--history-messages))))
             (should (string-match-p "message 20" (buffer-string)))
             (should (string-suffix-p
                      "draft"
@@ -1325,55 +1428,6 @@
                    "*Fermium: Example room / @alice:example.org*"))
     (should (equal (fermium-room--header-line) "▸ Example room"))
     (should-not (string-match-p "Example room" (buffer-string)))))
-
-(ert-deftest fermium-room-renders-messages-in-chronological-order ()
-  (with-temp-buffer
-    (fermium-room-mode)
-    (fermium-room--render-room
-     (list (cons "room_id" "!room:example.org"))
-     (list (list (cons "event_id" "$latest")
-                 (cons "body" "latest")
-                 (cons "timestamp" "3000"))
-           (list (cons "event_id" "$earliest")
-                 (cons "body" "earliest")
-                 (cons "timestamp" "1000"))
-           (list (cons "event_id" "$middle")
-                 (cons "body" "middle")
-                 (cons "timestamp" "2000"))))
-    (let ((earliest (string-match "earliest" (buffer-string)))
-          (middle (string-match "middle" (buffer-string)))
-          (latest (string-match "latest" (buffer-string))))
-      (should (< earliest middle))
-      (should (< middle latest)))))
-
-(ert-deftest fermium-room-inserts-live-messages-chronologically ()
-  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*")))
-    (unwind-protect
-        (with-current-buffer buffer
-          (fermium-room-mode)
-          (fermium-room--render-room
-           (list (cons "room_id" "!room:example.org"))
-           (list (list (cons "event_id" "$middle")
-                       (cons "body" "middle")
-                       (cons "timestamp" 2000))))
-          (fermium--handle-message-event
-           (list (cons "room_id" "!room:example.org")
-                 (cons "message"
-                       (list (cons "event_id" "$earliest")
-                             (cons "body" "earliest")
-                             (cons "timestamp" 1000)))))
-          (fermium--handle-message-event
-           (list (cons "room_id" "!room:example.org")
-                 (cons "message"
-                       (list (cons "event_id" "$latest")
-                             (cons "body" "latest")
-                             (cons "timestamp" 3000)))))
-          (let ((earliest (string-match "earliest" (buffer-string)))
-                (middle (string-match "middle" (buffer-string)))
-                (latest (string-match "latest" (buffer-string))))
-            (should (< earliest middle))
-            (should (< middle latest))))
-      (kill-buffer buffer))))
 
 (ert-deftest fermium-room-seeds-latest-message-while-history-loads ()
   (with-temp-buffer
@@ -1635,40 +1689,6 @@
                     (line-beginning-position) (line-end-position)))))
       (kill-buffer buffer))))
 
-(ert-deftest fermium-room-update-preserves-history-scroll-position ()
-  (save-window-excursion
-    (let ((buffer (get-buffer-create " *Fermium room history scroll test*")))
-      (unwind-protect
-          (progn
-            (switch-to-buffer buffer)
-            (fermium-room-mode)
-            (setq fermium-room--room-id "!room:example.org")
-            (fermium-room--render-room
-             (list (cons "room_id" "!room:example.org"))
-             (mapcar
-              (lambda (number)
-                (list (cons "event_id" (format "$%d" number))
-                      (cons "sender" "@bob:example.org")
-                      (cons "body" (format "history message %d" number))
-                      (cons "timestamp" number)))
-              (number-sequence 1 40)))
-            (goto-char (point-min))
-            (search-forward "history message 10")
-            (beginning-of-line)
-            (set-window-start (selected-window) (point))
-            (redisplay)
-            (let ((scroll-start (window-start)))
-              (fermium--handle-message-event
-               (list (cons "room_id" "!room:example.org")
-                     (cons "message"
-                           (list (cons "event_id" "$latest")
-                                 (cons "sender" "@bob:example.org")
-                                 (cons "body" "history message latest")
-                                 (cons "timestamp" 41)))))
-              (should (= (window-start) scroll-start))))
-        (when (buffer-live-p buffer)
-          (kill-buffer buffer))))))
-
 (ert-deftest fermium-room-update-pins-composition-scroll-to-bottom ()
   (save-window-excursion
     (let ((buffer (get-buffer-create " *Fermium room composition scroll test*")))
@@ -1697,9 +1717,101 @@
                                (cons "body" "history message latest")
                                (cons "timestamp" 41)))))
             (should (= (point) (point-max)))
-            (should (> (window-start) (point-min))))
+            (should (> (window-start) (point-min)))
+            ;; The converse: a reader is not dragged along.  With point back
+            ;; in the history, a message arriving has to leave the scroll
+            ;; where it is, or reading is interrupted every time the room
+            ;; moves.
+            (goto-char (point-min))
+            (set-window-start (selected-window) (point-min))
+            (redisplay)
+            (let ((scroll-start (window-start)))
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "event_id" "$later")
+                                 (cons "sender" "@bob:example.org")
+                                 (cons "body" "history message later")
+                                 (cons "timestamp" 42)))))
+              (should (= (window-start) scroll-start))))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-update-keeps-a-window-inside-a-rewritten-section ()
+  (save-window-excursion
+    (let ((buffer (get-buffer-create " *Fermium room section scroll test*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (fermium-room-mode)
+            (setq fermium-room--room-id "!room:example.org")
+            (fermium-room--render-room
+             (list (cons "room_id" "!room:example.org"))
+             (cl-loop for index from 1 to 60
+                      collect (list (cons "kind" "channel_event")
+                                    (cons "event_id" (format "$c%d" index))
+                                    (cons "body" (format "event number %d" index))
+                                    (cons "timestamp" (* index 1000)))))
+            (goto-char (point-min))
+            (search-forward "Channel events")
+            (beginning-of-line)
+            (fermium-room-toggle-channel-events)
+            (goto-char (point-min))
+            (search-forward "event number 30")
+            (beginning-of-line)
+            (set-window-start (selected-window) (point))
+            (redisplay)
+            (let ((line (fermium-test--window-start-line)))
+              ;; The arriving event restates the whole run, and the window
+              ;; started inside the text that replaces.  Emacs collapses a
+              ;; window start there to where the replacement began, so the
+              ;; reader has to be carried across by what they were reading.
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "kind" "channel_event")
+                                 (cons "event_id" "$c61")
+                                 (cons "body" "event number 61")
+                                 (cons "timestamp" 61000)))))
+              (should (equal line (fermium-test--window-start-line)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-toggling-the-first-section-keeps-it-protected ()
+  (with-temp-buffer
+    (fermium-test--seed-room '(("$join" 1000 channel) ("$hi" 2000)))
+    ;; The fold arrow is the first character the section prints, so toggling
+    ;; a section that opens the room rewrites `point-min' and has to make it
+    ;; front-sticky again, exactly as any other edit to the first message.
+    (goto-char (point-min))
+    (fermium-room-toggle-channel-events)
+    (should (equal (get-text-property (point-min) 'front-sticky)
+                   '(read-only keymap)))
+    (should (eq 'caught
+                (condition-case nil
+                    (progn (goto-char (point-min)) (insert "x") 'inserted)
+                  (text-read-only 'caught))))))
+
+(ert-deftest fermium-room-loading-animation-restates-every-placeholder ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (setq fermium-room--room-id "!room:example.org")
+    (dotimes (index 20)
+      (puthash (format "$img%d" index) (list :status 'loading)
+               fermium-room--image-states))
+    (let ((fermium--loading-frame 1))
+      (fermium-room--render-room
+       (list (cons "room_id" "!room:example.org"))
+       (cl-loop for index from 0 below 20
+                collect (fermium-test--image-message index))))
+    (should (= 20 (how-many "^\\.$" (point-min) (point-max))))
+    ;; A longer frame grows every placeholder, and so the history under
+    ;; them.  A pass bounded by a position taken before it started would
+    ;; stop short and leave the last placeholders on the previous frame.
+    (let ((fermium--loading-frame 3))
+      (fermium-room--render-loading-images))
+    (should (= 20 (how-many "^\\.\\.\\.$" (point-min) (point-max))))
+    (should (= 0 (how-many "^\\.$" (point-min) (point-max))))))
 
 (ert-deftest fermium-room-update-pins-an-inactive-composition-window ()
   (save-window-excursion
@@ -1879,6 +1991,417 @@
        (list (cons "room_id" "!room:example.org")
              (cons "message" message)))
       (should (= 1 (how-many "once" (point-min) (point-max)))))))
+
+(ert-deftest fermium-room-live-message-does-not-rebuild-the-history ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           (list (list (cons "event_id" "$first")
+                       (cons "sender" "@bob:example.org")
+                       (cons "body" "first")
+                       (cons "timestamp" 1000))))
+          (let ((node (fermium-room--node-for-key "$first")))
+            (dolist (event '(("$second" "second" 2000)
+                             ("$third" "third" 3000)))
+              (fermium--handle-message-event
+               (list (cons "room_id" "!room:example.org")
+                     (cons "message"
+                           (list (cons "event_id" (nth 0 event))
+                                 (cons "sender" "@bob:example.org")
+                                 (cons "body" (nth 1 event))
+                                 (cons "timestamp" (nth 2 event)))))))
+            ;; Appending a message must not tear down and re-insert the rest
+            ;; of the history: the node rendering the first message is still
+            ;; the one that was rendering it.
+            (should (eq node (fermium-room--node-for-key "$first"))))
+          (let ((text (buffer-string)))
+            (should (< (string-match "first" text)
+                       (string-match "second" text)))
+            (should (< (string-match "second" text)
+                       (string-match "third" text))))
+          ;; Repeated appends have to keep landing inside the read-only
+          ;; history rather than drifting into the composition, which means
+          ;; the history end marker advanced with each one.
+          (dolist (key '("$second" "$third"))
+            (let ((position (fermium-room--message-position key)))
+              (should position)
+              (should (get-text-property position 'read-only))
+              (should (< position
+                         (marker-position fermium-room--input-start))))))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-live-channel-event-joins-the-folded-section ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           ;; An ordinary message ahead of the section, so a room that
+           ;; rebuilt itself would render more than the section alone.
+           (list (list (cons "event_id" "$hello")
+                       (cons "sender" "@bob:example.org")
+                       (cons "body" "hello")
+                       (cons "timestamp" 500))
+                 (list (cons "kind" "channel_event")
+                       (cons "event_id" "$join")
+                       (cons "body" "Alice joined")
+                       (cons "timestamp" 1000))))
+          (should (string-match-p "Channel events (1)" (buffer-string)))
+          ;; Restating the one section the event joins is enough: it is the
+          ;; only unit of history the room renders again.
+          (should (= 1 (fermium-test--rendered-units
+                        (lambda ()
+                          (fermium--handle-message-event
+                           (list (cons "room_id" "!room:example.org")
+                                 (cons "message"
+                                       (list (cons "kind" "channel_event")
+                                             (cons "event_id" "$leave")
+                                             (cons "body" "Bob left")
+                                             (cons "timestamp" 2000)))))))))
+          ;; The event folds into the section already on screen instead of
+          ;; opening a second one, and that section keeps the identity of its
+          ;; first event so its expansion state stays addressable.
+          (should (= 1 (how-many "Channel events" (point-min) (point-max))))
+          (should (string-match-p "Channel events (2)" (buffer-string)))
+          (should (string-match-p "Bob left" (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "Channel events")
+          (beginning-of-line)
+          (should (equal (get-text-property
+                          (point) 'fermium-room-channel-events-id)
+                         "$join")))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-live-channel-event-keeps-the-section-expanded ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           (list (list (cons "kind" "channel_event")
+                       (cons "event_id" "$join")
+                       (cons "body" "Alice joined")
+                       (cons "timestamp" 1000))))
+          (goto-char (point-min))
+          (search-forward "Channel events")
+          (beginning-of-line)
+          (fermium-room-toggle-channel-events)
+          (should-not (invisible-p (save-excursion (forward-line 1) (point))))
+          (fermium--handle-message-event
+           (list (cons "room_id" "!room:example.org")
+                 (cons "message"
+                       (list (cons "kind" "channel_event")
+                             (cons "event_id" "$leave")
+                             (cons "body" "Bob left")
+                             (cons "timestamp" 2000)))))
+          (goto-char (point-min))
+          (search-forward "Channel events")
+          (beginning-of-line)
+          (should (string-match-p "▾" (buffer-string)))
+          (should-not (invisible-p (save-excursion (forward-line 1) (point)))))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-out-of-order-channel-event-can-open-its-run ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*"))
+        (earliest (list (cons "kind" "channel_event")
+                        (cons "event_id" "$create")
+                        (cons "body" "Alice created the room")
+                        (cons "timestamp" 500)))
+        (joined (list (cons "kind" "channel_event")
+                      (cons "event_id" "$join")
+                      (cons "body" "Alice joined")
+                      (cons "timestamp" 1000)))
+        (left (list (cons "kind" "channel_event")
+                    (cons "event_id" "$leave")
+                    (cons "body" "Bob left")
+                    (cons "timestamp" 3000))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           (list joined left))
+          (fermium--handle-message-event
+           (list (cons "room_id" "!room:example.org")
+                 (cons "message" earliest)))
+          ;; The arriving event becomes the run's first, which is what the
+          ;; section is keyed on, so the section changes identity.  The
+          ;; incremental path has to agree with a render from scratch.
+          (should (= 1 (how-many "Channel events" (point-min) (point-max))))
+          (goto-char (point-min))
+          (search-forward "Channel events")
+          (beginning-of-line)
+          (should (equal (get-text-property
+                          (point) 'fermium-room-channel-events-id)
+                         "$create"))
+          (should (equal (fermium-test--history-text)
+                         (fermium-test--full-render
+                          (list earliest joined left)))))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-equal-timestamps-render-in-history-order ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*"))
+        (existing (list (cons "event_id" "$existing")
+                        (cons "sender" "@bob:example.org")
+                        (cons "body" "existing")
+                        (cons "timestamp" 1000)))
+        (tied (list (cons "event_id" "$tied")
+                    (cons "sender" "@bob:example.org")
+                    (cons "body" "tied")
+                    (cons "timestamp" 1000))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           (list existing))
+          (fermium--handle-message-event
+           (list (cons "room_id" "!room:example.org")
+                 (cons "message" tied)))
+          ;; Two events can share a timestamp.  Wherever the arriving one is
+          ;; placed, the buffer and the history have to agree, or the room
+          ;; reshuffles the next time it is rendered in full.
+          (should (equal (fermium-test--rendered-keys)
+                         (fermium-test--history-keys)))
+          (should (equal (fermium-test--rendered-keys)
+                         '("$existing" "$tied")))
+          (should (equal (fermium-test--history-text)
+                         (fermium-test--rerendered-history))))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-message-lookup-finds-every-rendered-message ()
+  (with-temp-buffer
+    (let ((specs nil))
+      ;; Alternate plain messages and runs of channel events, so the lookup
+      ;; has to reach events folded inside a section as well as ordinary
+      ;; messages standing on their own.
+      (dotimes (i 40)
+        (push (list (format "$m%d" i) (* (1+ i) 10)) specs)
+        (push (list (format "$c%da" i) (+ (* (1+ i) 10) 1) 'channel) specs)
+        (push (list (format "$c%db" i) (+ (* (1+ i) 10) 2) 'channel) specs))
+      (setq specs (nreverse specs))
+      (fermium-test--seed-room specs)
+      (let ((previous (point-min)))
+        (dolist (spec specs)
+          (let ((region (fermium-room--message-region (nth 0 spec))))
+            ;; Every message is found, at text that is its own, and the
+            ;; regions follow the order the history is in without overlap.
+            (should region)
+            (should (<= previous (car region)))
+            (should (< (car region) (cdr region)))
+            (should (equal (get-text-property (car region)
+                                              'fermium-room-message-key)
+                           (nth 0 spec)))
+            (setq previous (cdr region)))))
+      ;; A key that is not rendered is reported missing.
+      (should-not (fermium-room--message-region "$absent")))))
+
+(defconst fermium-test--incremental-cases
+  ;; label, messages the room starts with, messages delivered one at a time.
+  '(("a message arriving after the last one"
+     (("$a" 1000)) (("$b" 2000)))
+    ("a message arriving before the first one"
+     (("$b" 2000)) (("$a" 1000)))
+    ("a message arriving between two messages"
+     (("$a" 1000) ("$c" 3000)) (("$b" 2000)))
+    ("a channel event opening a folded run"
+     (("$b" 2000 channel) ("$c" 3000 channel)) (("$a" 1000 channel)))
+    ("a channel event landing inside a folded run"
+     (("$a" 1000 channel) ("$c" 3000 channel)) (("$b" 2000 channel)))
+    ("a channel event extending a folded run"
+     (("$a" 1000 channel) ("$b" 2000 channel)) (("$c" 3000 channel)))
+    ("a channel event with no run to join"
+     (("$a" 1000)) (("$b" 2000 channel)))
+    ("a message splitting a folded run in two"
+     (("$a" 1000 channel) ("$c" 3000 channel)) (("$b" 2000)))
+    ("a message arriving before a folded run"
+     (("$b" 2000 channel) ("$c" 3000 channel)) (("$a" 1000)))
+    ("a message arriving after a folded run"
+     (("$a" 1000 channel) ("$b" 2000 channel)) (("$c" 3000)))
+    ("a run growing on both sides of a message"
+     (("$a" 1000 channel) ("$d" 4000 channel)) (("$b" 2000) ("$c" 3000 channel)))
+    ("two messages sharing a timestamp"
+     (("$a" 1000)) (("$b" 1000)))
+    ("two channel events sharing a timestamp"
+     (("$a" 1000 channel)) (("$b" 1000 channel)))
+    ("an event repeated at the same time"
+     (("$a" 1000)) (("$a" 1000)))
+    ("an echo correcting its own time in place"
+     (("$a" 1000) ("$b" 5000)) (("$b" 4000)))
+    ("an echo corrected while between two runs"
+     (("$a" 1000 channel) ("$b" 2000) ("$c" 3000 channel)) (("$b" 2500)))
+    ("an echo corrected out from between two runs"
+     (("$a" 1000 channel) ("$b" 2000) ("$c" 3000 channel)) (("$b" 4000)))
+    ("an echo corrected back past a folded run"
+     (("$a" 1000 channel) ("$b" 2000) ("$c" 3000 channel)) (("$b" 500)))
+    ("an echo corrected past another message"
+     (("$a" 1000) ("$b" 2000) ("$c" 3000)) (("$c" 1500))))
+  "Ways a message can reach a room that is already on screen.")
+
+(ert-deftest fermium-room-incremental-updates-match-a-full-render ()
+  (dolist (case fermium-test--incremental-cases)
+    (let ((label (nth 0 case))
+          (buffer (get-buffer-create "*Fermium: !room:example.org*")))
+      (ert-info (label)
+        (unwind-protect
+            (with-current-buffer buffer
+              (fermium-test--seed-room (nth 1 case))
+              ;; Whatever arrives, the room ends up in the order the history
+              ;; is in and reads exactly as a render of that history from
+              ;; scratch would.
+              (fermium-test--deliver (nth 2 case))
+              (should (equal (fermium-test--rendered-keys)
+                             (fermium-test--history-keys)))
+              (should (equal (fermium-test--history-text)
+                             (fermium-test--rerendered-history))))
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-incremental-update-renders-only-what-it-touches ()
+  (dolist (case fermium-test--incremental-cases)
+    (let* ((label (nth 0 case))
+           ;; A tail of unrelated messages, all older than anything a case
+           ;; delivers, so a room that rebuilds itself renders far more than
+           ;; one that updates in place.
+           (ballast (cl-loop for index from 1 to 40
+                             collect (list (format "$ballast%d" index)
+                                           (- (* index 10) 10000))))
+           (buffer (get-buffer-create "*Fermium: !room:example.org*")))
+      (ert-info (label)
+        (unwind-protect
+            (with-current-buffer buffer
+              (fermium-test--seed-room (append ballast (nth 1 case)))
+              (should (< (fermium-test--deliver (nth 2 case))
+                         (length ballast))))
+          (kill-buffer buffer))))))
+
+(defconst fermium-test--incremental-point-cases
+  ;; label, starting messages, delivered messages, where point is, where it
+  ;; should still be.  `heading' means the folded section's heading line.
+  '(("reading a message when a later one arrives"
+     (("$a" 1000)) (("$b" 2000)) "$a" "$a")
+    ("reading a message when an earlier one arrives"
+     (("$b" 2000)) (("$a" 1000)) "$b" "$b")
+    ("reading an event whose run is rewritten around it"
+     (("$a" 1000 channel) ("$c" 3000 channel)) (("$b" 2000 channel)) "$c" "$c")
+    ("reading a run's heading while it is rewritten"
+     (("$a" 1000 channel) ("$c" 3000 channel)) (("$b" 2000 channel))
+     heading heading)
+    ("reading a message whose echo corrects its time"
+     (("$a" 1000) ("$b" 5000)) (("$b" 4000)) "$b" "$b")
+    ("reading a message whose echo moves it"
+     (("$a" 1000 channel) ("$b" 2000) ("$c" 3000 channel)) (("$b" 4000))
+     "$b" "$b")
+    ("reading a message beside a run that is rewritten"
+     (("$a" 1000 channel) ("$c" 3000 channel) ("$d" 9000))
+     (("$b" 2000 channel)) "$d" "$d"))
+  "Where a reader's point has to stay while a room is updated around it.")
+
+(ert-deftest fermium-room-incremental-updates-keep-the-reader-in-place ()
+  (dolist (case fermium-test--incremental-point-cases)
+    (let ((label (nth 0 case))
+          (target (nth 3 case))
+          (expected (nth 4 case))
+          (buffer (get-buffer-create "*Fermium: !room:example.org*")))
+      (ert-info (label)
+        (unwind-protect
+            (with-current-buffer buffer
+              (fermium-test--seed-room (nth 1 case))
+              ;; Expand any folded section so its events are places a reader
+              ;; can actually be.
+              (goto-char (point-min))
+              (when (search-forward "Channel events" nil t)
+                (beginning-of-line)
+                (fermium-room-toggle-channel-events))
+              (goto-char (point-min))
+              (if (eq target 'heading)
+                  (progn (search-forward "Channel events")
+                         (beginning-of-line))
+                (search-forward target)
+                (goto-char (match-beginning 0)))
+              (fermium-test--deliver (nth 2 case))
+              (if (eq expected 'heading)
+                  (should (string-match-p
+                           "Channel events"
+                           (buffer-substring-no-properties
+                            (line-beginning-position) (line-end-position))))
+                (should (equal (get-text-property
+                                (point) 'fermium-room-message-key)
+                               expected))))
+          (kill-buffer buffer))))))
+
+(ert-deftest fermium-room-synced-echo-supersedes-a-locally-timed-message ()
+  (let ((buffer (get-buffer-create "*Fermium: !room:example.org*"))
+        (older (list (cons "event_id" "$older")
+                     (cons "sender" "@bob:example.org")
+                     (cons "body" "older")
+                     (cons "timestamp" 1000)))
+        (local (list (cons "event_id" "$sent")
+                     (cons "sender" "@me:example.org")
+                     (cons "body" "hello")
+                     (cons "timestamp" 5000)))
+        (synced (list (cons "event_id" "$sent")
+                      (cons "sender" "@me:example.org")
+                      (cons "body" "hello")
+                      (cons "timestamp" 4000))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (fermium-room-mode)
+          (setq fermium-room--room-id "!room:example.org")
+          (fermium-room--render-room
+           (list (cons "room_id" "!room:example.org"))
+           (list older))
+          ;; A sent message is shown at once, timed by the local clock, and
+          ;; comes back through sync carrying the homeserver's time.
+          (fermium--handle-message-event
+           (list (cons "room_id" "!room:example.org") (cons "message" local)))
+          (fermium--handle-message-event
+           (list (cons "room_id" "!room:example.org") (cons "message" synced)))
+          (should (equal (fermium-test--history-keys) '("$older" "$sent")))
+          (should (= 1 (how-many "hello" (point-min) (point-max))))
+          ;; The homeserver's time is the room's, so it is the one kept.
+          (should (equal (mapcar (lambda (message)
+                                   (fermium--event-value message "timestamp"))
+                                 (fermium-room--history-messages))
+                         '(1000 4000)))
+          (should (equal (fermium-test--rendered-keys)
+                         (fermium-test--history-keys)))
+          (should (equal (fermium-test--history-text)
+                         (fermium-test--rerendered-history))))
+      (kill-buffer buffer))))
+
+(ert-deftest fermium-room-replacing-the-first-message-keeps-it-protected ()
+  (with-temp-buffer
+    (fermium-room-mode)
+    (let ((first (list (cons "event_id" "$first")
+                       (cons "sender" "@bob:example.org")
+                       (cons "body" "first")
+                       (cons "timestamp" 1000))))
+      (fermium-room--render-room
+       (list (cons "room_id" "!room:example.org"))
+       (list first
+             (list (cons "event_id" "$second")
+                   (cons "sender" "@bob:example.org")
+                   (cons "body" "second")
+                   (cons "timestamp" 2000))))
+      (should (= (fermium-room--message-position "$first") (point-min)))
+      (fermium-room--refresh-message "$first")
+      ;; A `read-only' property does not stop insertion immediately before
+      ;; the first character carrying it, so a rewritten first character has
+      ;; to be made front-sticky again.
+      (should (equal (get-text-property (point-min) 'front-sticky)
+                     '(read-only keymap)))
+      (should (= 1 (how-many "first" (point-min) (point-max))))
+      (should (= 1 (how-many "second" (point-min) (point-max)))))))
 
 (ert-deftest fermium-room-send-recovers-from-a-send-error ()
   (with-temp-buffer
@@ -2444,7 +2967,7 @@
              fermium-room--image-states)
     (let ((fermium--loading-frame 0))
       (should (equal (fermium-room--image-loading-dots) "."))
-      (fermium-room--render-history nil)
+      (fermium-room--render-history (fermium-room--history-messages))
       (goto-char (point-min))
       (let ((image-position nil))
         (while (and (not image-position) (< (point) (point-max)))
@@ -2546,21 +3069,47 @@
                                           :max-width 640
                                           :max-height 480))
                fermium-room--image-states)
+      (fermium-room--render-room
+       (list (cons "room_id" "!room:example.org"))
+       (list (list (cons "event_id" "$image")
+                   (cons "sender" "@bob:example.org")
+                   (cons "body" "photo.png")
+                   (cons "timestamp" 0)
+                   (cons "image"
+                         (list (cons "source"
+                                     (list (cons "url"
+                                                 "mxc://example.org/image"))))))
+             (list (cons "event_id" "$text")
+                   (cons "sender" "@bob:example.org")
+                   (cons "body" "unrelated")
+                   (cons "timestamp" 1))))
       (cl-letf (((symbol-function 'window-live-p)
                  (lambda (_) t))
                 ((symbol-function 'window-inside-pixel-edges)
                  (lambda (_) '(0 0 320 200)))
                 ((symbol-function 'fermium-room--render-history)
-                 (lambda (_) (setq rendered t)))
+                 (lambda (&rest _) (setq rendered t)))
                 ((symbol-function 'image-flush)
                  (lambda (&rest _) nil)))
         (fermium-room--refresh-image-sizes 'room-window)
         (let ((image (plist-get (gethash "$image" fermium-room--image-states)
-                                :image)))
-          (should rendered)
+                                :image))
+              (position (text-property-not-all
+                         (point-min) (point-max) 'display nil)))
+          ;; Refitting replaces only the messages carrying an image, and
+          ;; leaves the rest of the history in place.
+          (should-not rendered)
+          (should (= 1 (how-many "unrelated" (point-min) (point-max))))
           (should (= (plist-get (cdr image) :scale) 1))
           (should (= (plist-get (cdr image) :max-width) 320))
-          (should (= (plist-get (cdr image) :max-height) 200)))))))
+          (should (= (plist-get (cdr image) :max-height) 200))
+          ;; The refitted descriptor is the one now installed in the buffer.
+          ;; `insert-image' augments the descriptor it is given, so compare
+          ;; the fitted dimensions rather than object identity.
+          (should position)
+          (should (= (plist-get (cdr (get-text-property position 'display))
+                                :max-width)
+                     320)))))))
 
 (ert-deftest fermium-room-flushes-replaced-image-descriptors ()
   (with-temp-buffer
@@ -2579,12 +3128,22 @@
                      :type 'png
                      :image old-image)
                fermium-room--image-states)
+      (fermium-room--render-room
+       (list (cons "room_id" "!room:example.org"))
+       (list (list (cons "event_id" "$image")
+                   (cons "sender" "@bob:example.org")
+                   (cons "body" "photo.png")
+                   (cons "timestamp" 0)
+                   (cons "image"
+                         (list (cons "source"
+                                     (list (cons "url"
+                                                 "mxc://example.org/image"))))))))
       (cl-letf (((symbol-function 'window-live-p)
                  (lambda (_) t))
                 ((symbol-function 'window-inside-pixel-edges)
                  (lambda (_) '(0 0 320 200)))
                 ((symbol-function 'fermium-room--render-history)
-                 (lambda (_)
+                 (lambda (&rest _)
                    (setq rendered t)))
                 ((symbol-function 'image-flush)
                  (lambda (image &optional _frame)
@@ -2593,7 +3152,7 @@
         (let ((new-image (plist-get (gethash "$image"
                                              fermium-room--image-states)
                                     :image)))
-          (should rendered)
+          (should-not rendered)
           (should (memq old-image flushed))
           (should (memq new-image flushed))
           (should (= (length flushed) 2))))
