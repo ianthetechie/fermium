@@ -2493,8 +2493,8 @@
                  (lambda () nil))
                 ((symbol-function 'fermium--stop-loading-animation-if-idle)
                  (lambda () nil))
-                ((symbol-function 'image-flush)
-                 (lambda (&rest _) nil)))
+                ((symbol-function 'display-graphic-p)
+                 (lambda (&optional _) t)))
         (fermium-room-display-image)
         (should (string-match-p "\\." (buffer-string)))
         (funcall callback
@@ -2514,6 +2514,120 @@
         (should (eq (plist-get (gethash "$image" fermium-room--image-states)
                                :status)
                     'ready))))))
+
+(defvar kitty-graphics-mode)
+
+(ert-deftest fermium-room-converts-non-png-images-for-terminal-display ()
+  (let ((jpeg (unibyte-string #xff #xd8 #xff #xe0))
+        (png (base64-decode-string
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
+        source)
+    (cl-letf (((symbol-function 'image-convert)
+               (lambda (file)
+                 (setq source file)
+                 (should (equal image-convert-to-format "png"))
+                 (should (equal (file-name-extension file) "jpeg"))
+                 (with-temp-buffer
+                   (set-buffer-multibyte nil)
+                   (insert-file-contents-literally file)
+                   (should (equal (buffer-string) jpeg)))
+                 png)))
+      (let ((file (fermium-room--prepare-terminal-image jpeg 'jpeg)))
+        (unwind-protect
+            (progn
+              (should-not (file-exists-p source))
+              (should (equal (file-name-extension file) "png"))
+              (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert-file-contents-literally file)
+                (should (equal (buffer-string) png))))
+          (delete-file file))))))
+
+(ert-deftest fermium-room-displays-downloaded-images-through-kitty-on-tty ()
+  (let ((buffer (generate-new-buffer " *Fermium terminal image test*"))
+        (kitty-graphics-mode t)
+        (encoded "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        (displayed-file nil)
+        (image-overlay nil)
+        (display-succeeds nil)
+        (graphical nil)
+        (create-native (symbol-function 'fermium-room--create-image)))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (lambda (&optional _) graphical))
+              ((symbol-function 'fermium-room--create-image)
+               (lambda (&rest args)
+                 (should graphical)
+                 (apply create-native args)))
+              ((symbol-function 'kitty-graphics-display-image)
+               (lambda (file start end max-cols max-rows)
+                 (should (eq (current-buffer) buffer))
+                 (should (equal (file-name-extension file) "png"))
+                 (should (equal (with-temp-buffer
+                                  (set-buffer-multibyte nil)
+                                  (insert-file-contents-literally file)
+                                  (buffer-string))
+                                (base64-decode-string encoded)))
+                 (should (= max-cols (window-body-width)))
+                 (should (= max-rows (window-body-height)))
+                 (should-not (and image-overlay (overlay-buffer image-overlay)))
+                 (setq displayed-file file)
+                 (when display-succeeds
+                   (setq image-overlay (make-overlay start end)))))
+              ((symbol-function 'kitty-graphics-remove-images)
+               (lambda ()
+                 (when image-overlay
+                   (delete-overlay image-overlay)))))
+      (unwind-protect
+          (save-window-excursion
+            (set-window-buffer (selected-window) buffer)
+            (with-current-buffer buffer
+              (fermium-room-mode)
+              (fermium-room--render-room
+               '(("room_id" . "!room:example.org"))
+               '((("event_id" . "$image")
+                  ("sender" . "@bob:example.org")
+                  ("body" . "photo.png")
+                  ("timestamp" . 0)
+                  ("image" ("source" ("url" . "mxc://example.org/image"))))))
+              (let ((event `(("type" . "media_downloaded") ("data" . ,encoded))))
+                (fermium-room--handle-image-download buffer "$image" event)
+                (should displayed-file)
+                (should-not (file-exists-p displayed-file))
+                (goto-char (point-min))
+                (search-forward "[Image]")
+                (should (equal (fermium-room--image-key-at-point) "$image"))
+                (should-not (gethash "$image" fermium-room--image-states))
+                (setq display-succeeds t)
+                (fermium-room--handle-image-download buffer "$image" event)
+                (should (eq (plist-get (gethash "$image" fermium-room--image-states)
+                                       :status)
+                            'ready))
+                (let ((first-overlay image-overlay)
+                      (file displayed-file))
+                  (fermium-room--render-history)
+                  (should-not (overlay-buffer first-overlay))
+                  (should (eq (overlay-buffer image-overlay) buffer))
+                  (should (equal displayed-file file))
+                  (should (file-exists-p displayed-file))
+                  ;; Move the same room through a graphical and a text-only
+                  ;; frame, then return to terminal graphics without fetching.
+                  (setq graphical t)
+                  (fermium-room--refresh-image-sizes (selected-window))
+                  (should-not (overlay-buffer image-overlay))
+                  (should (text-property-not-all (point-min) (point-max)
+                                                 'display nil))
+                  (setq graphical nil)
+                  (let ((kitty-graphics-mode nil))
+                    (fermium-room--refresh-image-sizes (selected-window))
+                    (goto-char (point-min))
+                    (search-forward "[Image]")
+                    (should (equal (fermium-room--image-key-at-point) "$image")))
+                  (fermium-room--refresh-image-sizes (selected-window))
+                  (should (eq (overlay-buffer image-overlay) buffer))
+                  (should (equal displayed-file file))))))
+        (kill-buffer buffer))
+      (should-not (overlay-buffer image-overlay))
+      (should-not (file-exists-p displayed-file)))))
 
 (ert-deftest fermium-room-fits-downloaded-images-to-the-room-window ()
   (with-temp-buffer
@@ -2539,6 +2653,7 @@
           (rendered nil))
       (puthash "$image"
                (list :status 'ready
+                     :renderer 'native
                      :data image-data
                      :type 'png
                      :image (create-image image-data 'png t
@@ -2546,7 +2661,9 @@
                                           :max-width 640
                                           :max-height 480))
                fermium-room--image-states)
-      (cl-letf (((symbol-function 'window-live-p)
+      (cl-letf (((symbol-function 'fermium-room--image-renderer)
+                 (lambda (_) 'native))
+                ((symbol-function 'window-live-p)
                  (lambda (_) t))
                 ((symbol-function 'window-inside-pixel-edges)
                  (lambda (_) '(0 0 320 200)))
@@ -2575,11 +2692,14 @@
            (rendered nil))
       (puthash "$image"
                (list :status 'ready
+                     :renderer 'native
                      :data image-data
                      :type 'png
                      :image old-image)
                fermium-room--image-states)
-      (cl-letf (((symbol-function 'window-live-p)
+      (cl-letf (((symbol-function 'fermium-room--image-renderer)
+                 (lambda (_) 'native))
+                ((symbol-function 'window-live-p)
                  (lambda (_) t))
                 ((symbol-function 'window-inside-pixel-edges)
                  (lambda (_) '(0 0 320 200)))
@@ -2636,11 +2756,14 @@
                                  :max-height 200)))
         (puthash "$image"
                  (list :status 'ready
+                       :renderer 'native
                        :data image-data
                        :type 'png
                        :image image)
                  fermium-room--image-states)
-        (cl-letf (((symbol-function 'window-live-p)
+        (cl-letf (((symbol-function 'fermium-room--image-renderer)
+                   (lambda (_) 'native))
+                  ((symbol-function 'window-live-p)
                    (lambda (_) t))
                   ((symbol-function 'window-inside-pixel-edges)
                    (lambda (_) '(0 0 320 200)))

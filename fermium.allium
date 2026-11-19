@@ -124,6 +124,13 @@ surface RoomConversation {
         -- While a message is being sent, the input is locked. On an error or
         -- timeout, the input is re-enabled, the pending text is retained, and
         -- an error is shown in the messages or minibuffer.
+
+    @guarantee RequestedImagesDisplayInline
+        -- When the viewer activates an image message, a successful download
+        -- displays it inline on a graphical frame or a terminal with graphics
+        -- enabled. If display fails, the image link remains available to retry.
+        -- Moving the room to another supported display reuses downloaded
+        -- images. A text-only display shows an image placeholder.
 }
 
 rule LoginSucceeds {

@@ -16,11 +16,18 @@
 (require 'cl-lib)
 (require 'json)
 (require 'image)
+(require 'image-converter)
 (require 'svg nil t)
 (require 'seq)
 (require 'subr-x)
 (require 'transient)
 (require 'url-parse)
+
+(declare-function kitty-graphics-display-image "kitty-graphics"
+                  (file &optional beg end max-cols max-rows))
+(declare-function kitty-graphics-remove-images "kitty-graphics"
+                  (&optional beg end))
+(defvar kitty-graphics-mode)
 
 (defgroup fermium nil
   "Matrix client for Emacs."
@@ -403,6 +410,8 @@ coloring, or replace it with a custom list of faces."
             #'fermium-room--remember-point-position nil t)
   (add-hook 'post-command-hook
             #'fermium-room--maybe-mark-latest-message-read nil t)
+  (add-hook 'change-major-mode-hook
+            #'fermium-room--cleanup-images nil t)
   (add-hook 'kill-buffer-hook
             #'fermium-room--cleanup-images nil t))
 
@@ -455,7 +464,7 @@ coloring, or replace it with a custom list of faces."
           (setq fermium-room--sending nil)
           (fermium-room--finish-loading)
           (when (hash-table-p fermium-room--image-states)
-            (fermium-room--flush-image-states)
+            (fermium-room--release-images)
             (clrhash fermium-room--image-states))
           (fermium-room--set-input-read-only nil))))))
 
@@ -2161,6 +2170,7 @@ buffers can still be created while a room's name is being resolved."
 
 (defun fermium-room--render-header (title)
   "Reset rendered room content and update its fixed header."
+  (fermium-room--remove-terminal-images)
   (setq fermium-room--room-title title)
   (when (and (overlayp fermium-room--composition-overlay)
              (overlay-buffer fermium-room--composition-overlay))
@@ -2646,15 +2656,109 @@ for the text returned by the fixed room header's mode-line formatter."
     ;; it, every resize leaves another native image in the cache until the
     ;; global eviction timer runs, even though the descriptor is no longer in
     ;; the buffer.
-    (image-flush image)))
+    ;; The all-frames form also works when the selected frame is a TTY.
+    (image-flush image t)))
 
-(defun fermium-room--flush-image-states ()
-  "Flush all image descriptors retained by the current room state."
+(defun fermium-room--remove-terminal-images ()
+  "Remove terminal image overlays before replacing room text."
+  (when (fboundp 'kitty-graphics-remove-images)
+    (kitty-graphics-remove-images)))
+
+(defun fermium-room--release-image (state)
+  "Release the image resources owned by STATE."
+  (fermium-room--flush-image (plist-get state :image))
+  (when-let* ((file (plist-get state :file)))
+    (delete-file file)))
+
+(defun fermium-room--release-images ()
+  "Release the current room's image resources."
+  (fermium-room--remove-terminal-images)
   (when (hash-table-p fermium-room--image-states)
     (maphash
      (lambda (_key state)
-       (fermium-room--flush-image (plist-get state :image)))
+       (fermium-room--release-image state))
      fermium-room--image-states)))
+
+(defun fermium-room--write-terminal-image (data type)
+  "Write image DATA to a private temporary file with suffix TYPE."
+  (let ((file (make-temp-file "fermium-image-" nil (format ".%s" type)))
+        (written nil)
+        (coding-system-for-write 'no-conversion))
+    (unwind-protect
+        (progn
+          (write-region data nil file nil 'silent)
+          (setq written t)
+          file)
+      (unless written
+        (delete-file file)))))
+
+(defun fermium-room--prepare-terminal-image (data type)
+  "Return a private PNG file for terminal display of image DATA of TYPE."
+  (unless (eq type 'png)
+    (let ((source (fermium-room--write-terminal-image data type))
+          (image-convert-to-format "png"))
+      (unwind-protect
+          (setq data (image-convert source))
+        (delete-file source)))
+    (unless (and (stringp data) (eq (image-type-from-data data) 'png))
+      (error "Could not convert %s to PNG for terminal display" type)))
+  (fermium-room--write-terminal-image data 'png))
+
+(defun fermium-room--image-renderer (window)
+  "Return the image renderer available for WINDOW."
+  (cond
+   ((display-graphic-p (and window (window-frame window))) 'native)
+   ((and window (bound-and-true-p kitty-graphics-mode)
+         (fboundp 'kitty-graphics-display-image))
+    'terminal)))
+
+(defun fermium-room--insert-terminal-image (state window)
+  "Insert terminal image STATE fitted to WINDOW."
+  (let* ((start (point))
+         (file (or (plist-get state :file)
+                   (fermium-room--prepare-terminal-image (plist-get state :data)
+                                                         (plist-get state :type)))))
+    (plist-put state :file file)
+    (insert " ")
+    (unless (save-excursion
+              (with-selected-window window
+                (kitty-graphics-display-image
+                 file start (1+ start)
+                 (max 1 (window-body-width window))
+                 (max 1 (window-body-height window)))))
+      (error "kitty-graphics could not prepare this image"))
+    (plist-put state :fit-size (fermium-room--image-fit-size window))))
+
+(defun fermium-room--insert-ready-image (key state)
+  "Insert downloaded image STATE for KEY, returning nil for a text placeholder."
+  (let* ((start (point))
+         (window (get-buffer-window (current-buffer) t))
+         (renderer (fermium-room--image-renderer window)))
+    (plist-put state :renderer renderer)
+    (condition-case error
+        (pcase renderer
+          ('native
+           (let ((image (or (plist-get state :image)
+                            (fermium-room--create-image (plist-get state :data)
+                                                        (plist-get state :type)
+                                                        window))))
+             (unless image
+               (error "Emacs does not support this image format"))
+             (unless (plist-get state :image)
+               (fermium-room--flush-image image)
+               (plist-put state :image image))
+             (insert-image image " ")
+             t))
+          ('terminal (fermium-room--insert-terminal-image state window))
+          (_ (insert "[Image]") nil))
+      (error
+       (delete-region start (point))
+       (fermium-room--release-image state)
+       (remhash key fermium-room--image-states)
+       (insert "[Image]")
+       (message "Fermium: could not display image: %s"
+                (error-message-string error))
+       nil))))
 
 (defun fermium-room--image-fit-size (&optional window)
   "Return the pixel bounds for fitting an image in WINDOW.
@@ -2693,31 +2797,31 @@ on the inside edges of WINDOW."
        (equal (plist-get (cdr image) :max-height) (cdr size))))
 
 (defun fermium-room--refresh-image-sizes (window)
-  "Refit ready images whose descriptors do not match WINDOW's dimensions."
+  "Refit ready images to WINDOW's dimensions."
   (when (and (derived-mode-p 'fermium-room-mode)
              (not fermium-room--resizing-images))
-    (let ((size (fermium-room--image-fit-size window)))
+    (let* ((size (fermium-room--image-fit-size window))
+           (renderer (fermium-room--image-renderer window)))
       (when size
         (let ((changed nil)
               (old-images nil))
           (maphash
            (lambda (key state)
-             (when (and (eq (plist-get state :status) 'ready)
-                        (stringp (plist-get state :data))
-                        (plist-get state :type))
-               (unless (fermium-room--image-fits-size-p
-                        (plist-get state :image) size)
-                 (let ((old-image (plist-get state :image))
-                       (new-image
-                        (fermium-room--create-image
-                         (plist-get state :data)
-                         (plist-get state :type)
-                         window)))
-                   (push old-image old-images)
-                   ;; Match `image-mode': discard any stale native data for
-                   ;; the descriptor before putting it into display text.
-                   (fermium-room--flush-image new-image)
-                   (puthash key (plist-put state :image new-image)
+             (when (eq (plist-get state :status) 'ready)
+               (when (or (not (eq renderer (plist-get state :renderer)))
+                         (and (eq renderer 'terminal)
+                              (not (equal size (plist-get state :fit-size)))))
+                 (setq changed t))
+               (when (and (eq renderer 'native)
+                          (plist-get state :image)
+                          (not (fermium-room--image-fits-size-p
+                                (plist-get state :image) size)))
+                 (push (plist-get state :image) old-images)
+                 (let ((image (fermium-room--create-image
+                               (plist-get state :data) (plist-get state :type)
+                               window)))
+                   (fermium-room--flush-image image)
+                   (puthash key (plist-put state :image image)
                             fermium-room--image-states))
                  (setq changed t))))
            fermium-room--image-states)
@@ -2740,9 +2844,9 @@ on the inside edges of WINDOW."
     (setq fermium-room--image-resize-timer nil)))
 
 (defun fermium-room--cleanup-images ()
-  "Release room image resources when the buffer is being killed."
+  "Release room image resources when leaving room mode or killing the buffer."
   (fermium-room--cancel-image-resize-timer)
-  (fermium-room--flush-image-states))
+  (fermium-room--release-images))
 
 (defun fermium-room--refresh-image-sizes-in-buffer (buffer window)
   "Refresh room images in BUFFER for WINDOW after an idle delay."
@@ -2753,7 +2857,8 @@ on the inside edges of WINDOW."
       (condition-case-unless-debug error
           (when (and (derived-mode-p 'fermium-room-mode)
                      (eq (window-buffer window) buffer))
-            (fermium-room--refresh-image-sizes window))
+            (fermium-room--refresh-image-sizes
+             (get-buffer-window buffer t)))
         (error
          (fermium--report-elisp-error "image resize timer" error))))))
 
@@ -2828,7 +2933,7 @@ that a header click cannot fall through to PRIMARY-selection insertion."
 
 (defun fermium-room--render-image-error (key message)
   (when-let ((state (gethash key fermium-room--image-states)))
-    (fermium-room--flush-image (plist-get state :image)))
+    (fermium-room--release-image state))
   (remhash key fermium-room--image-states)
   (fermium-room--render-history
    (and fermium-room--input-start
@@ -2839,7 +2944,8 @@ that a header click cannot fall through to PRIMARY-selection insertion."
 
 (defun fermium-room--handle-image-download (buffer key event)
   "Handle a downloaded image EVENT for BUFFER and message KEY."
-  (when (buffer-live-p buffer)
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer (derived-mode-p 'fermium-room-mode)))
     (with-current-buffer buffer
       (if (equal (fermium--event-value event "type") "error")
           (fermium-room--render-image-error
@@ -2847,27 +2953,19 @@ that a header click cannot fall through to PRIMARY-selection insertion."
         (condition-case error
             (let* ((encoded (fermium--event-value event "data"))
                    (data (base64-decode-string encoded))
-                   (type (image-type-from-data data))
-                   (image (and type (fermium-room--create-image data type))))
-              (if (not image)
-                  (fermium-room--render-image-error
-                   key "Emacs does not support this image format")
-                ;; Match `image-mode': discard stale native data before the
-                ;; descriptor is installed in display text.
-                (fermium-room--flush-image image)
-                (when-let ((old-state (gethash key fermium-room--image-states)))
-                  (fermium-room--flush-image (plist-get old-state :image)))
-                (puthash key
-                         (list :status 'ready
-                               :data data
-                               :type type
-                               :image image)
-                         fermium-room--image-states)
-                (fermium-room--render-history
-                 (and fermium-room--input-start
-                      (buffer-substring-no-properties
-                       fermium-room--input-start (point-max))))
-                (fermium--stop-loading-animation-if-idle)))
+                   (type (image-type-from-data data)))
+              (unless type
+                (error "Emacs does not recognize this image format"))
+              (when-let* ((old-state (gethash key fermium-room--image-states)))
+                (fermium-room--release-image old-state))
+              (puthash key (list :status 'ready :data data :type type
+                                 :renderer nil :image nil :file nil :fit-size nil)
+                       fermium-room--image-states)
+              (fermium-room--render-history
+               (and fermium-room--input-start
+                    (buffer-substring-no-properties
+                     fermium-room--input-start (point-max))))
+              (fermium--stop-loading-animation-if-idle))
           (error
            (fermium-room--render-image-error
             key (error-message-string error))))))))
@@ -2880,9 +2978,12 @@ that a header click cannot fall through to PRIMARY-selection insertion."
     (cond
      ((not key) (message "Fermium: no image at point"))
      ((not source) (message "Fermium: image has no media source"))
-     ((memq (plist-get (gethash key fermium-room--image-states) :status)
-            '(loading ready))
+     ((eq (plist-get (gethash key fermium-room--image-states) :status) 'loading)
       nil)
+     ((eq (plist-get (gethash key fermium-room--image-states) :status) 'ready)
+      (if (fermium-room--image-renderer (selected-window))
+          (fermium-room--refresh-image-sizes (selected-window))
+        (message "Fermium: inline images require a graphics-capable display")))
      (t
       (let ((buffer (current-buffer)))
         (puthash key (list :status 'loading)
@@ -3088,7 +3189,8 @@ stable reference time."
            (image-source (and image
                               (fermium--event-value image "source")))
            (image-state (and image-key
-                             (gethash image-key fermium-room--image-states))))
+                             (gethash image-key fermium-room--image-states)))
+           (image-displayed nil))
       (setq timestamp
             (fermium-room--format-timestamp timestamp-value))
       (insert timestamp)
@@ -3114,7 +3216,8 @@ stable reference time."
             (if (eq (plist-get image-state :status) 'ready)
                 ;; Keep the display image separate from its sender line and
                 ;; don't leave an alt-text placeholder or link styling behind.
-                (insert-image (plist-get image-state :image) " ")
+                (setq image-displayed
+                      (fermium-room--insert-ready-image image-key image-state))
               (insert (if (eq (plist-get image-state :status) 'loading)
                           (fermium-room--image-loading-dots)
                         "[Image]"))))
@@ -3129,8 +3232,7 @@ stable reference time."
          keymap ,fermium-room--read-only-map
          fermium-room-message-key ,(fermium-room--message-key message)
          fermium-room--message-timestamp ,timestamp-value))
-      (when (and image
-                 (not (eq (plist-get image-state :status) 'ready)))
+      (when (and image (not image-displayed))
         (fermium-room--add-face-properties body-start body-end 'button)
         (add-text-properties
          body-start body-end
